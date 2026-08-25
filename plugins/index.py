@@ -251,7 +251,7 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot, skip, collection_type="p
                     continue
                 
                 file_size = getattr(media, 'file_size', 0)
-                if file_size < 2097152:  
+                if collection_type != 'archive' and file_size < 2097152:
                     badfiles += 1
                     continue
                 
