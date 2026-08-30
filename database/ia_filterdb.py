@@ -382,6 +382,43 @@ async def get_db_spell_suggestions(query, limit=5, collection_type="all"):
         if len(suggestions) >= limit:
             break
 
+    # ✅ FIX: पूरी तरह अनजान/बिगड़ा हुआ query (जैसे "Hootx") पर ऊपर वाला
+    # stemmed $text search भी कभी-कभी कुछ नहीं देता (कोई शब्द match ही नहीं
+    # होता), और तब पहले suggestions पूरी तरह खाली रह जाते थे। अब उस case में
+    # query के पहले 3 अक्षरों से एक ढीला "prefix" regex fallback चलाया जाता है
+    # — ताकि कम से कम मिलते-जुलते शुरुआती अक्षरों वाले titles तो सुझाए जा सकें।
+    if not suggestions and len(q) >= 3:
+        prefix = re.escape(q[:3])
+        prefix_regex = re.compile(r'(\b|[\s.\-_])' + prefix, re.IGNORECASE)
+        try:
+            tasks = [
+                col.find(
+                    {"file_name": prefix_regex},
+                    {"file_name": 1}
+                ).limit(15).to_list(length=15)
+                for col in cols
+            ]
+            prefix_results = await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            logger.debug(f"DB spell suggestion prefix-fallback failed: {e}")
+            prefix_results = []
+
+        prefix_candidates = []
+        for res in prefix_results:
+            if isinstance(res, Exception):
+                continue
+            prefix_candidates.extend(res)
+
+        for doc in prefix_candidates:
+            title = _clean_title_guess(doc.get("file_name", ""))
+            key = title.lower()
+            if not title or key in seen:
+                continue
+            seen.add(key)
+            suggestions.append(title.title())
+            if len(suggestions) >= limit:
+                break
+
     return suggestions
 
 
