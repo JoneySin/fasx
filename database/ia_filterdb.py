@@ -323,21 +323,16 @@ async def get_search_results(query, max_results, offset=0, lang=None, collection
 # वाकई मौजूद कंटेंट से जुड़ा होता है, Google जैसा "फिर भी नहीं मिला"
 # वाला case नहीं आता, और कोई external API call भी नहीं लगती)
 # ─────────────────────────────────────────────────────────
-_JUNK_RE = re.compile(
-    r'(19\d{2}|20\d{2}|\d{3,4}p|4k|8k|s\d{1,2}e\d{1,3}|season\s?\d{1,2}|'
-    r'web-?dl|webrip|hdrip|bluray|brrip|hdtv|dvdrip|camrip|hdcam|'
-    r'hevc|x264|x265|aac|esub|dual\s?audio|multi|hindi|english|tamil|telugu)',
-    re.IGNORECASE
-)
-
 def _clean_title_guess(file_name: str) -> str:
-    """file_name में से resolution/year/quality/language जैसे junk tokens के
-    पहले तक का हिस्सा असली टाइटल मानकर काट लेता है।"""
+    """✅ FIX: पहले यहाँ quality/resolution/year/extension जैसे tokens को
+    ढूंढकर काट दिया जाता था और फिर casing भी बदली जाती थी — इससे suggestion
+    का टेक्स्ट DB में save असली file_name से अलग दिखता था (जैसे "l" की जगह
+    "L", या "1080p l Test" वाला हिस्सा पूरी तरह गायब)। अब suggestion हमेशा
+    file_name जैसा DB में है बिल्कुल वैसा ही (सिर्फ extra/multiple spaces
+    normalize करके) दिखाया जाता है — कोई trimming, cleaning या case-change
+    नहीं।"""
     if not file_name: return ""
-    m = _JUNK_RE.search(file_name)
-    title = file_name[:m.start()] if m else file_name
-    title = re.sub(r'\s+', ' ', title).strip(" -._")
-    return title
+    return re.sub(r'\s+', ' ', file_name).strip()
 
 async def get_db_spell_suggestions(query, limit=5, collection_type="all"):
     q = str(query or "").strip()
@@ -378,7 +373,7 @@ async def get_db_spell_suggestions(query, limit=5, collection_type="all"):
         if not title or key in seen:
             continue
         seen.add(key)
-        suggestions.append(title.title())
+        suggestions.append(title)
         if len(suggestions) >= limit:
             break
 
@@ -415,7 +410,7 @@ async def get_db_spell_suggestions(query, limit=5, collection_type="all"):
             if not title or key in seen:
                 continue
             seen.add(key)
-            suggestions.append(title.title())
+            suggestions.append(title)
             if len(suggestions) >= limit:
                 break
 
