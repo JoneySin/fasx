@@ -339,8 +339,15 @@ async def auto_filter(client, msg, collection_type="all", settings=None):
                     [InlineKeyboardButton(f"🔍 {s}", callback_data=f"spellchk_{msg.from_user.id}_{skey}_{i}")]
                     for i, s in enumerate(suggestions)
                 ]
-                names = "\n".join(f"• __{s}__" for s in suggestions)
-                cap = f"❌ **{search}** not found.\n\n🤔 **Did you mean:**\n{names}"
+                # ✅ FIX: पहले caption में suggestions की पूरी लिस्ट फिर से लिखी
+                # जाती थी, जबकि नीचे buttons में वही नाम पहले से दिख रहे होते हैं
+                # — दोहराव अच्छा नहीं लगता, इसलिए caption अब सिर्फ छोटा सा prompt
+                # है। साथ ही suggestions मौजूद होने पर "❌ not found" जैसा error
+                # tone हटाकर सिर्फ "Did you mean" वाला दोस्ताना सवाल रखा है।
+                # ✅ FIX: caption में search term फिर से लिखा जा रहा था, जबकि वो
+                # पहले से ऊपर quoted reply (Mission/Flizz ब्लॉक) में दिख रहा
+                # होता है — इसलिए अब caption सिर्फ "Did you mean?" रखा है।
+                cap = "🤔 **Did you mean?**"
                 try:
                     await m.edit_text(cap, reply_markup=InlineKeyboardMarkup(btn))
                     asyncio.create_task(start_auto_delete_timer(client, m.chat.id, m.id, delay=300))
