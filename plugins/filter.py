@@ -11,7 +11,7 @@ from hydrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from info import ADMINS, DELETE_TIME, MAX_BOT_RESULTS, IS_PREMIUM, PICS, SPELL_CHECK
 from utils import is_premium, get_size, is_check_admin, temp, get_settings, save_group_settings
-from database.ia_filterdb import get_search_results
+from database.ia_filterdb import get_search_results, get_db_spell_suggestions
 from database.users_chats_db import db
 from Script import script  
 
@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 BUTTONS = LRU(300) 
 SRC_TO_SHORT = {"primary": "pri", "cloud": "cld", "archive": "arc", "all": "all"}
 SHORT_TO_SRC = {"pri": "primary", "cld": "cloud", "arc": "archive", "all": "all"}
+
+# ✅ FIX: Spell-suggestions को callback_data में सीधे embed करने के बजाय यहाँ
+# message-id के हिसाब से store किया जाता है, और callback_data में सिर्फ एक
+# छोटा index भेजा जाता है। इससे लंबे suggestion नामों पर Telegram के 64-byte
+# callback_data limit की वजह से बटन fail होने का खतरा खत्म हो जाता है।
+SPELL_SUGGESTIONS = LRU(300)
 
 # ⚡ स्मार्ट डिक्शनरी जो चालू टाइमर्स को ट्रैक करेगी ताकि रिसेट किया जा सके
 ACTIVE_DELETE_TASKS = {}
@@ -79,7 +85,29 @@ async def get_http_session():
         _http_session = aiohttp.ClientSession()
     return _http_session
 
-async def get_spell_suggestion(query):
+async def get_spell_suggestions(query, limit=5):
+    """
+    ✅ FIX: पहले सिर्फ Google Suggest से suggestion मिलता था, जो कई बार ऐसा नाम
+    सुझा देता था जो bot के अपने catalog में मौजूद ही नहीं होता (user को फिर
+    "Still no results found" दिखता)। अब पहले खुद के DB (file_name text index)
+    से करीबी titles ढूँढे जाते हैं — ये हमेशा गारंटीड मौजूद कंटेंट होते हैं।
+    DB में कुछ भी करीबी न मिले तभी Google Suggest को fallback की तरह इस्तेमाल
+    किया जाता है।
+    """
+    db_suggestions = await get_db_spell_suggestions(query, limit=limit)
+    if db_suggestions:
+        return db_suggestions
+    return await get_google_spell_suggestions(query, limit=limit)
+
+async def get_google_spell_suggestions(query, limit=5):
+    """
+    Google Suggest से एक साथ कई suggestions लाता है (पहले सिर्फ पहला वाला लिया
+    जाता था — data[1][0] — बाकी सारे suggestions जो API वैसे भी भेजता है, वो
+    अनदेखे हो जाते थे)।
+    - "movie"/"series" suffix हटाया जाता है
+    - duplicates (case-insensitive) हटाए जाते हैं
+    - original query जैसा suggestion बाहर रखा जाता है
+    """
     try:
         session = await get_http_session()
         # ✅ FIX: query को ठीक से URL-encode किया — पहले raw string (spaces/Hindi
@@ -93,13 +121,24 @@ async def get_spell_suggestion(query):
             # जो नीचे के bare except में चुपचाप निगल लिया जाता था। content_type=None
             # से यह strict चेक बंद हो जाता है।
             data = await resp.json(content_type=None)
-            if data and len(data) > 1 and data[1]:
-                suggestion = data[1][0].replace(" movie", "").replace(" series", "").strip()
-                if suggestion.lower() != query.lower():
-                    return suggestion.title()
+            if not data or len(data) <= 1 or not data[1]:
+                return []
+
+            seen = {query.lower().strip()}
+            suggestions = []
+            for raw in data[1]:
+                cleaned = raw.replace(" movie", "").replace(" series", "").strip()
+                key = cleaned.lower()
+                if not cleaned or key in seen:
+                    continue
+                seen.add(key)
+                suggestions.append(cleaned.title())
+                if len(suggestions) >= limit:
+                    break
+            return suggestions
     except Exception as e:
         logger.debug(f"Spell suggestion fetch failed: {e}")
-    return None
+    return []
 
 # ─────────────────────────────────────────────
 # 🎨 UI HELPER FUNCTION (Minimalist Layout Lock)
@@ -281,12 +320,29 @@ async def auto_filter(client, msg, collection_type="all", settings=None):
         # था) पूरी तरह अनदेखा हो जाता था। अब global flag एक master kill-switch है,
         # और उसके अंदर per-group setting असल में मायने रखती है।
         if SPELL_CHECK and settings.get("spell_check", True):
-            suggestion = await get_spell_suggestion(search)
-            if suggestion:
-                btn = [[InlineKeyboardButton(f"✅ Yes, search '{suggestion}'", callback_data=f"spellchk_{msg.from_user.id}_{suggestion}")]]
-                cap = f"❌ **{search}** not found.\n\n🤔 **Did you mean:** __{suggestion}__?"
+            # ✅ FIX: पहले सिर्फ़ 1 suggestion मिलता था, अब Google Suggest से मिले
+            # सारे (5 तक) suggestions एक-एक बटन के रूप में दिखाए जाते हैं ताकि
+            # सही टाइटल चुनने का ज़्यादा मौका मिले।
+            suggestions = await get_spell_suggestions(search, limit=5)
+            if suggestions:
                 try:
-                    m = await msg.reply(cap, reply_markup=InlineKeyboardMarkup(btn), quote=True)
+                    m = await msg.reply("🤔 Checking spelling...", quote=True)
+                except:
+                    return
+                # ✅ FIX: callback_data में सीधे suggestion टेक्स्ट के बजाय सिर्फ
+                # index भेजा जाता है — असली नाम इस reply message के id के तहत
+                # SPELL_SUGGESTIONS में रखा जाता है, इसलिए लंबे नामों पर भी
+                # callback_data कभी 64-byte limit नहीं तोड़ता।
+                skey = f"{m.chat.id}-{m.id}"
+                SPELL_SUGGESTIONS[skey] = suggestions
+                btn = [
+                    [InlineKeyboardButton(f"🔍 {s}", callback_data=f"spellchk_{msg.from_user.id}_{skey}_{i}")]
+                    for i, s in enumerate(suggestions)
+                ]
+                names = "\n".join(f"• __{s}__" for s in suggestions)
+                cap = f"❌ **{search}** not found.\n\n🤔 **Did you mean:**\n{names}"
+                try:
+                    await m.edit_text(cap, reply_markup=InlineKeyboardMarkup(btn))
                     asyncio.create_task(start_auto_delete_timer(client, m.chat.id, m.id, delay=300))
                 except: pass
                 return
@@ -343,10 +399,17 @@ async def close_callback(client, query):
 @Client.on_callback_query(filters.regex(r"^spellchk_"))
 async def spell_check_handler(client, query):
     try:
-        _, req_id, suggestion = query.data.split("_", 2)
+        # ✅ FIX: callback_data अब सिर्फ़ index रखता है; असली suggestion टेक्स्ट
+        # SPELL_SUGGESTIONS[skey] से निकाला जाता है (देखें ऊपर wildcard-search हैंडलर)।
+        _, req_id, skey, idx = query.data.split("_", 3)
         if int(req_id) != query.from_user.id:
             return await query.answer("❌ This suggestion is not for you!", show_alert=True)
-            
+
+        suggestions = SPELL_SUGGESTIONS.get(skey)
+        if not suggestions or int(idx) >= len(suggestions):
+            return await query.answer("❌ This suggestion has expired, please search again.", show_alert=True)
+        suggestion = suggestions[int(idx)]
+
         await query.answer(f"🔍 Searching for {suggestion}...", show_alert=False)
         counts_out = {}
         files, next_offset, total, act_src = await get_search_results(suggestion, MAX_BOT_RESULTS, 0, collection_type="all", counts_out=counts_out)
