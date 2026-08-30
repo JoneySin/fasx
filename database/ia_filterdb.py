@@ -318,6 +318,74 @@ async def get_search_results(query, max_results, offset=0, lang=None, collection
 
 
 # ─────────────────────────────────────────────────────────
+# 🧠 DB-BASED SPELL SUGGESTIONS (Google Suggest के बजाय अपने ही
+# catalog से "Did you mean" सुझाव — इसलिए सुझाया गया नाम हमेशा
+# वाकई मौजूद कंटेंट से जुड़ा होता है, Google जैसा "फिर भी नहीं मिला"
+# वाला case नहीं आता, और कोई external API call भी नहीं लगती)
+# ─────────────────────────────────────────────────────────
+_JUNK_RE = re.compile(
+    r'(19\d{2}|20\d{2}|\d{3,4}p|4k|8k|s\d{1,2}e\d{1,3}|season\s?\d{1,2}|'
+    r'web-?dl|webrip|hdrip|bluray|brrip|hdtv|dvdrip|camrip|hdcam|'
+    r'hevc|x264|x265|aac|esub|dual\s?audio|multi|hindi|english|tamil|telugu)',
+    re.IGNORECASE
+)
+
+def _clean_title_guess(file_name: str) -> str:
+    """file_name में से resolution/year/quality/language जैसे junk tokens के
+    पहले तक का हिस्सा असली टाइटल मानकर काट लेता है।"""
+    if not file_name: return ""
+    m = _JUNK_RE.search(file_name)
+    title = file_name[:m.start()] if m else file_name
+    title = re.sub(r'\s+', ' ', title).strip(" -._")
+    return title
+
+async def get_db_spell_suggestions(query, limit=5, collection_type="all"):
+    q = str(query or "").strip()
+    if not q: return []
+
+    cols = [primary, cloud, archive] if collection_type == "all" else [COLLECTIONS.get(collection_type, primary)]
+    seen = {q.lower()}
+    candidates = []
+
+    try:
+        # ✅ unquoted $text search जानबूझकर लगाया — get_search_results वाला strict
+        # (हर शब्द quoted, phrase-जैसा) search typo पर कुछ नहीं देगा। यहाँ ढीला
+        # OR-style stemmed match चाहिए ताकि छोटी spelling गलतियों पर भी करीबी
+        # titles मिल जाएँ।
+        tasks = [
+            col.find(
+                {"$text": {"$search": q}},
+                {"file_name": 1, "score": {"$meta": "textScore"}}
+            ).sort([("score", {"$meta": "textScore"})]).limit(15).to_list(length=15)
+            for col in cols
+        ]
+        results_lists = await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as e:
+        logger.debug(f"DB spell suggestion text-search failed: {e}")
+        return []
+
+    for res in results_lists:
+        if isinstance(res, Exception):
+            continue
+        candidates.extend(res)
+
+    candidates.sort(key=lambda d: d.get("score", 0), reverse=True)
+
+    suggestions = []
+    for doc in candidates:
+        title = _clean_title_guess(doc.get("file_name", ""))
+        key = title.lower()
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        suggestions.append(title.title())
+        if len(suggestions) >= limit:
+            break
+
+    return suggestions
+
+
+# ─────────────────────────────────────────────────────────
 # 🆕 RECENT FILES (कोई query ना हो तब dashboard पर दिखाने के लिए
 # — सबसे नई अपलोड की गई फाइलें, ताकि पेज खाली ना लगे)
 # ─────────────────────────────────────────────────────────
