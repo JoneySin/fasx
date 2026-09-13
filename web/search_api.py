@@ -9,30 +9,24 @@ import hashlib
 import asyncio
 import logging
 import urllib.parse
-import orjson
 from lru import LRU
 from aiohttp import web
 
 # कस्टमाइज्ड कोर यूटिल्स और कन्फर्म कंट्रोल्स इम्पोर्ट्स
 from utils import temp, get_size, is_premium
 # ✅ SYNC: THUMBNAIL_STORAGE_CHANNEL को इम्पोर्ट किया गया है पृथक स्टोरेज के लिए
-from info import BIN_CHANNEL, ADMINS, BOT_TOKEN, MAX_WEB_RESULTS, MAX_THUMB_CACHE, IS_PREMIUM, USE_CAPTION_FILTER, THUMBNAIL_STORAGE_CHANNEL
+from info import BIN_CHANNEL, ADMINS, BOT_TOKEN, MAX_WEB_RESULTS, MAX_THUMB_CACHE, IS_PREMIUM, THUMBNAIL_STORAGE_CHANNEL
 # यहाँ db_stats के लिए 'db as filter_db' ऐड किया गया है
 from database.ia_filterdb import COLLECTIONS, get_search_results, get_recent_files, db as filter_db, delete_single_file
 from database.users_chats_db import db
 # ✅ SYNC FIX: cookie-session identity check अब यहाँ दोबारा नहीं लिखा, web_assets से reuse हो रहा है
-from web.web_assets import get_auth as web_get_auth
+# ✅ DRY: fast_json भी अब web_assets से ही आता है (पहले search_api/actor_routes/
+# post_routes तीनों में इसकी अलग-अलग copy थी)।
+from web.web_assets import get_auth as web_get_auth, fast_json
 
 logger = logging.getLogger(__name__)
 
 search_routes = web.RouteTableDef()
-
-# ─────────────────────────────────────────────────────────
-# ⚡ ULTRA-FAST ORJSON DUMP FUNCTION
-# ─────────────────────────────────────────────────────────
-def fast_json(data):
-    """orjson बाइट्स (bytes) में डेटा देता है, aiohttp के लिए इसे स्ट्रिंग में डिकोड करना होता है"""
-    return orjson.dumps(data).decode('utf-8')
 
 # ✅ BUG FIX: यह duplicate function हटाया गया।
 # ia_filterdb.py के get_search_results()/_search() पहले से ही raw query से
@@ -369,7 +363,24 @@ async def get_telegram_thumb(req):
 
 # ─────────────────────────────────────────────────────────
 # 🎥 STREAM SETUP PIPELINE
+# ✅ DRY: GET और POST दोनों versions में वही 4-step tunnel logic (send_cached_media
+# → delete-queue → play-count → URL बनाना) दो बार लिखा था। अब सिर्फ़ input parsing
+# और response format अलग है, असली काम एक ही _tunnel_stream() करता है।
 # ─────────────────────────────────────────────────────────
+def stream_target_path(msg_id: int, mode: str) -> str:
+    """watch/download mode को सही route path में बदलता है (unknown mode → watch)"""
+    return f"/{'download' if mode == 'download' else 'watch'}/{msg_id}"
+
+
+async def _tunnel_stream(fid: str, mode: str) -> str:
+    """BIN_CHANNEL में file भेजकर उसका watch/download path लौटाता है"""
+    msg = await temp.BOT.send_cached_media(chat_id=BIN_CHANNEL, file_id=fid)
+    await db.add_to_delete_queue(BIN_CHANNEL, msg.id, 3600)
+    if mode == "watch":
+        await db.track_video_play()
+    return stream_target_path(msg.id, mode)
+
+
 @search_routes.get("/setup_stream")
 async def setup_stream(req):
     role, _ = await get_user_role(req)
@@ -380,11 +391,7 @@ async def setup_stream(req):
     if not fid:
         return web.Response(text="❌ Missing file_id!", status=400)
     try:
-        msg = await temp.BOT.send_cached_media(chat_id=BIN_CHANNEL, file_id=fid)
-        await db.add_to_delete_queue(BIN_CHANNEL, msg.id, 3600)
-        if mode == "watch":
-            await db.track_video_play()
-        return web.HTTPFound(f"/{'download' if mode == 'download' else 'watch'}/{msg.id}")
+        return web.HTTPFound(await _tunnel_stream(fid, mode))
     except Exception as e:
         return web.Response(text=f"❌ Error Tunneling Stream: {e}", status=500)
 
@@ -404,11 +411,7 @@ async def setup_stream_post(req):
     if not fid:
         return web.json_response({"error": "Missing file_id!"}, status=400, dumps=fast_json)
     try:
-        msg = await temp.BOT.send_cached_media(chat_id=BIN_CHANNEL, file_id=fid)
-        await db.add_to_delete_queue(BIN_CHANNEL, msg.id, 3600)
-        if mode == "watch":
-            await db.track_video_play()
-        return web.json_response({"url": f"/{'download' if mode == 'download' else 'watch'}/{msg.id}"}, dumps=fast_json)
+        return web.json_response({"url": await _tunnel_stream(fid, mode)}, dumps=fast_json)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500, dumps=fast_json)
 
@@ -592,10 +595,10 @@ async def api_flush_cache(req):
 
 @search_routes.get("/miniapp")
 async def miniapp_page(req):
+    # ❌ DEAD CODE REMOVED: पहले "web/" न मिलने पर "Web/" (capital W) fallback भी
+    # चेक होता था, पर repo में ऐसा कोई directory है ही नहीं — वह शाखा कभी नहीं चलती थी।
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     html_path = os.path.join(base_dir, "web", "miniapp.html")
-    if not os.path.exists(html_path):
-        html_path = os.path.join(base_dir, "Web", "miniapp.html")
     if not os.path.exists(html_path):
         return web.Response(text="miniapp.html page template not found.", status=404)
     return web.FileResponse(html_path)

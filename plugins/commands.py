@@ -1,17 +1,19 @@
-import os
-import random
 import asyncio
+import random
 import logging
-from datetime import datetime
 from time import time as time_now
 from hydrogram import Client, filters, enums
 from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
 from Script import script
-# ✅ FIX: actors कलेक्शन को इम्पोर्ट किया गया ताकि हम डायरेक्टरी की गिनती कर सकें
-from database.ia_filterdb import db_count_documents, get_file_details, delete_files, actors
+# ✅ DRY: directory + post-category counts अब ia_filterdb के shared helpers से आते हैं
+# (पहले यहाँ actors.count_documents × 4 और posts aggregation खुद लिखी थी, और वही
+# ब्लॉक web/stats_routes.py में भी कॉपी था)।
+from database.ia_filterdb import (
+    db_count_documents, get_file_details, delete_files,
+    get_directory_counts, get_post_category_counts,
+)
 from database.users_chats_db import db
-from web.post_routes import posts_col
 
 from info import (
     IS_PREMIUM, URL, BIN_CHANNEL, ADMINS,
@@ -41,24 +43,56 @@ MINI_APP_URL = _build_mini_app_url(URL)
 
 
 # ─────────────────────────────────────────────
-# 📝 POST CMS STATS — category-wise counts (reused by /stats & stats callback)
+# 📊 STATS PAYLOAD BUILDER
+# ✅ DRY: यह पूरा "counts लाओ → STATUS_TXT format करो" ब्लॉक दो बार लिखा था —
+# /stats command में और ui_cb के "stats" branch में — और directory/post counts तो
+# web/stats_routes.py में तीसरी बार। तीनों जगह अलग-अलग होने की वजह से script.py
+# का placeholder बदलते ही कोई न कोई जगह IndexError देती थी। अब एक ही builder है।
+# ⚡ FAST: पहले 7+ DB calls sequentially चलते थे, अब independent वाले parallel हैं।
 # ─────────────────────────────────────────────
-async def _get_post_stats():
+async def build_stats_texts():
+    """(admin_status_text, user_status_text) लौटाता है। हर counter fail-safe है।"""
     try:
-        raw_post_counts = {}
-        pipeline = [{"$group": {"_id": {"$ifNull": ["$category", "Uncategorized"]}, "count": {"$sum": 1}}}]
-        async for doc in posts_col.aggregate(pipeline):
-            raw_post_counts[doc["_id"]] = doc["count"]
+        files = await db_count_documents()
+        f = files if isinstance(files, dict) else {}
     except Exception as e:
-        raw_post_counts = {}
-        logger.error(f"Post Stats Error: {e}")
+        f = {}
+        logger.error(f"File Stats Error: {e}")
 
-    post_movies = raw_post_counts.get("Movies", 0)
-    post_webseries = raw_post_counts.get("Web Series", 0)
-    post_appvid = raw_post_counts.get("App Video", 0)
-    post_porn = raw_post_counts.get("Porn", 0)
-    post_total = sum(raw_post_counts.values())
-    return post_total, post_movies, post_webseries, post_appvid, post_porn
+    # directory + posts + users/chats/premium — सब एक-दूसरे से independent हैं
+    (dir_total, dir_actors, dir_apps, dir_web), post_stats = await asyncio.gather(
+        get_directory_counts(),
+        get_post_category_counts(),
+    )
+    post_total, post_movies, post_webseries, post_appvid, post_porn = post_stats
+
+    try:
+        users, chats, premium = await asyncio.gather(
+            db.total_users_count(), db.total_chat_count(), db.get_premium_users_count()
+        )
+    except Exception:
+        users = chats = premium = 0
+
+    uptime = get_readable_time(time_now() - temp.START_TIME)
+
+    # STATUS_TXT → 21 placeholders
+    admin_text = script.STATUS_TXT.format(
+        users, chats, premium,
+        f.get('total', 0),
+        f.get('primary', 0), f.get('primary_thumb', 0),
+        f.get('cloud', 0), f.get('cloud_thumb', 0),
+        f.get('archive', 0), f.get('archive_thumb', 0),
+        dir_total, dir_actors, dir_apps, dir_web,
+        post_total, post_movies, post_webseries, post_appvid, post_porn,
+        f.get('total_thumb', 0), uptime
+    )
+
+    # USER_STATUS_TXT → 10 placeholders
+    user_text = script.USER_STATUS_TXT.format(
+        f.get('total', 0), f.get('primary', 0), f.get('cloud', 0), f.get('archive', 0),
+        dir_total, dir_actors, dir_apps, dir_web, post_total, uptime
+    )
+    return admin_text, user_text
 
 
 # ─────────────────────────────────────────────
@@ -137,8 +171,6 @@ async def start(client, message):
                     await db.add_to_delete_queue(message.chat.id, msg.id, PM_FILE_DELETE_TIME)
                     await db.add_to_delete_queue(message.chat.id, del_msg.id, PM_FILE_DELETE_TIME)
                     
-                    if not hasattr(temp, 'PM_FILES'):
-                        temp.PM_FILES = {}
                     temp.PM_FILES[msg.id] = {'file_msg': msg.id, 'note_msg': del_msg.id}
                 
                 return
@@ -171,46 +203,10 @@ async def stats(_, message):
     msg = await message.reply("🔄 Fetching Advanced Database Metrics...")
     
     try:
-        try:
-            files = await db_count_documents()
-            f = files if isinstance(files, dict) else {}
-        except Exception as e:
-            f = {}
-            logger.error(f"File Stats Error: {e}")
-
-        try: users = await db.total_users_count()
-        except: users = 0
-
-        try: chats = await db.total_chat_count()
-        except: chats = 0
-
-        try: premium = await db.premium.count_documents({"status.premium": True})
-        except: premium = 0
-
-        # 🗂️ Universal Directory Fetch
-        try:
-            tot_dir = await actors.count_documents({})
-            app_dir = await actors.count_documents({"category": "app"})
-            web_dir = await actors.count_documents({"category": "website"})
-            act_dir = tot_dir - app_dir - web_dir
-        except Exception as e:
-            tot_dir = app_dir = web_dir = act_dir = 0
-            logger.error(f"Directory Stats Error: {e}")
-
-        post_total, post_movies, post_webseries, post_appvid, post_porn = await _get_post_stats()
-
-        # ✅ FIX: 21 Formatting Args Required for STATUS_TXT
-        stats_text = script.STATUS_TXT.format(
-            users, chats, premium,
-            f.get('total', 0),
-            f.get('primary', 0), f.get('primary_thumb', 0),
-            f.get('cloud', 0), f.get('cloud_thumb', 0),
-            f.get('archive', 0), f.get('archive_thumb', 0),
-            tot_dir, act_dir, app_dir, web_dir,
-            post_total, post_movies, post_webseries, post_appvid, post_porn,
-            f.get('total_thumb', 0),
-            get_readable_time(time_now() - temp.START_TIME)
-        )
+        # ✅ DRY: पूरा counts+format काम अब build_stats_texts() में है (ui_cb के
+        # "stats" branch के साथ shared), इसलिए script.py का placeholder count बदलने
+        # पर दोनों जगह एक साथ सही रहेंगी।
+        stats_text, _ = await build_stats_texts()
 
         buttons = [
             [InlineKeyboardButton("❌ CLOSE PANEL", callback_data=f"close_{message.from_user.id}")]
@@ -334,53 +330,13 @@ async def ui_cb(client, query):
 
     elif data == "stats":
         try:
-            try: files = await db_count_documents()
-            except: files = {}
-            f = files if isinstance(files, dict) else {}
-            
-            uptime = get_readable_time(time_now() - temp.START_TIME)
-
-            try:
-                tot_dir = await actors.count_documents({})
-                app_dir = await actors.count_documents({"category": "app"})
-                web_dir = await actors.count_documents({"category": "website"})
-                act_dir = tot_dir - app_dir - web_dir
-            except:
-                tot_dir = app_dir = web_dir = act_dir = 0
-
-            post_total, post_movies, post_webseries, post_appvid, post_porn = await _get_post_stats()
-
-            if query.from_user.id in ADMINS:
-                try: users = await db.total_users_count()
-                except: users = 0
-                try: chats = await db.total_chat_count()
-                except: chats = 0
-                try: premium = await db.premium.count_documents({"status.premium": True})
-                except: premium = 0
-
-                # 21 Args for STATUS_TXT
-                text = script.STATUS_TXT.format(
-                    users, chats, premium,
-                    f.get('total',0),
-                    f.get('primary',0), f.get('primary_thumb',0),
-                    f.get('cloud',0), f.get('cloud_thumb',0),
-                    f.get('archive',0), f.get('archive_thumb',0),
-                    tot_dir, act_dir, app_dir, web_dir,
-                    post_total, post_movies, post_webseries, post_appvid, post_porn,
-                    f.get('total_thumb',0), uptime
-                )
-                btn = [
-                    [InlineKeyboardButton("⬅️ Back Menu", callback_data="back_start")]
-                ]
-            else:
-                # 10 Args for USER_STATUS_TXT
-                text = script.USER_STATUS_TXT.format(
-                    f.get('total',0), f.get('primary',0), f.get('cloud',0), f.get('archive',0),
-                    tot_dir, act_dir, app_dir, web_dir, post_total, uptime
-                )
-                btn = [[InlineKeyboardButton("⬅️ Back Menu", callback_data="back_start")]]
-                
-            buttons_markup = InlineKeyboardMarkup(btn)
+            # ✅ DRY: /stats command और यह callback पहले एक ही 40-लाइन का counts+format
+            # ब्लॉक दो बार चलाते थे। अब दोनों build_stats_texts() शेयर करते हैं।
+            admin_text, user_text = await build_stats_texts()
+            text = admin_text if query.from_user.id in ADMINS else user_text
+            buttons_markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back Menu", callback_data="back_start")]]
+            )
         except Exception as ex:
             return await query.answer(f"❌ Error displaying stats: {ex}", show_alert=True)
 
@@ -432,38 +388,8 @@ async def stream_cb(client, query):
         await query.answer(f"Error: {e}", show_alert=True)
 
 
-@Client.on_callback_query(filters.regex(r"^close_"))
-async def close_cb(c, q):
-    try:
-        parts = q.data.split("_")
-        if len(parts) > 1 and parts[1].isdigit() and int(parts[1]) != q.from_user.id:
-            return await q.answer("❌ You cannot close this result!", show_alert=True)
-
-        chat_id = q.message.chat.id
-        current_msg_id = q.message.id
-
-        msg_ids_to_clean = [current_msg_id]
-        if q.message.reply_to_message:
-            msg_ids_to_clean.append(q.message.reply_to_message.id)
-        elif getattr(q.message, "reply_to_message_id", None):
-            msg_ids_to_clean.append(q.message.reply_to_message_id)
-
-        if hasattr(temp, 'PM_FILES'):
-            target_key = None
-            for k, v in temp.PM_FILES.items():
-                if v.get('file_msg') == current_msg_id or k == current_msg_id:
-                    if v.get('note_msg'):
-                        msg_ids_to_clean.append(v.get('note_msg'))
-                    target_key = k
-                    break
-            if target_key:
-                del temp.PM_FILES[target_key]
-
-        for mid in msg_ids_to_clean:
-            if mid: await db.remove_from_delete_queue(chat_id, mid)
-
-        await c.delete_messages(chat_id, [m for m in msg_ids_to_clean if m])
-
-    except Exception as e:
-        try: await q.message.delete()
-        except: pass
+# ❌ DUPLICATE HANDLER REMOVED: यहाँ एक `close_cb` था जो plugins/filter.py के
+# close_callback के साथ `^close_` regex पर रजिस्टर होता था — यानी हर Close tap पर
+# दोनों चलते थे (दो बार delete + दो बार queue cleanup, दूसरी बार हमेशा exception)।
+# अब एक ही merged handler plugins/filter.py में है, जो PM_FILES, auto-delete timer
+# और search-result cache तीनों की सफाई करता है।

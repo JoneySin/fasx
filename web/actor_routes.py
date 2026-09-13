@@ -1,21 +1,13 @@
-import io, gc, time, html, re
-import orjson
+import io, time, html, re
 from aiohttp import web
 from bson.objectid import ObjectId
 from utils import temp, get_size
-# ✅ SYNC: ACTOR_STORAGE_CHANNEL को ऐड किया गया है पृथक अपलोड के लिए
-from info import BIN_CHANNEL, MAX_WEB_RESULTS, ACTOR_STORAGE_CHANNEL
+from info import MAX_WEB_RESULTS, ACTOR_STORAGE_CHANNEL
 from database.ia_filterdb import actors, get_actor_search_results, delete_actor_profile, delete_gallery_image_by_index
-from web.web_assets import build_page, get_auth, form_wrapper, require_active_plan
+# ✅ DRY: fast_json + DIRECTORY_CSS अब web_assets से आते हैं (पहले दोनों यहाँ copy थे)
+from web.web_assets import build_page, get_auth, form_wrapper, require_active_plan, fast_json, DIRECTORY_CSS
 
 actor_routes = web.RouteTableDef()
-
-# ─────────────────────────────────────────────────────────
-# ⚡ ULTRA-FAST ORJSON DUMP FUNCTION
-# ─────────────────────────────────────────────────────────
-def fast_json(data):
-    """orjson बाइट्स (bytes) में डेटा देता है, aiohttp के लिए इसे स्ट्रिंग में डिकोड करना होता है"""
-    return orjson.dumps(data).decode('utf-8')
 
 # ─────────────────────────────────────────────────────────
 # 🌐 MAIN HOMEPAGE: UNIVERSAL DIRECTORY WITH SEARCH & FILTERS
@@ -33,41 +25,7 @@ async def actors_directory_page(req):
     admin_btn = '''<button onclick="window.location.href='/admin/create_actor'" style="background:var(--accent); color:#fff; border:none; padding:10px 15px; border-radius:8px; font-weight:800; cursor:pointer; font-size:13px; flex:1; min-width:130px; box-shadow:0 4px 15px rgba(229,9,20,0.3); transition:0.2s;">➕ Create Profile</button>''' if role == 'admin' else ""
     
     search_ui = f'''
-    <style>
-        .dir-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }}
-        @media(min-width: 768px) {{ .dir-grid {{ grid-template-columns: repeat(5, 1fr); gap: 20px; }} }}
-        
-        .search-box {{ background:var(--card); border:1px solid var(--border); padding:16px; border-radius:12px; margin-bottom:25px; box-shadow:0 4px 15px rgba(0,0,0,0.1); }}
-        .s-row-1 {{ display: flex; gap: 10px; margin-bottom: 12px; position: relative; }}
-        .s-input {{ flex: 1; background:var(--bg3); border:1px solid var(--border); padding:12px 16px; color:var(--text); border-radius:8px; outline:none; font-family:inherit; font-weight:600; font-size:14px; transition:0.2s; }}
-        .s-input:focus {{ border-color:var(--accent); }}
-        .s-spinner {{ display:none; position:absolute; right:14px; top:50%; transform:translateY(-50%); width:16px; height:16px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:sSpin .6s linear infinite; }}
-        .s-row-1.loading .s-spinner {{ display:block; }}
-        @keyframes sSpin {{ to {{ transform:translateY(-50%) rotate(360deg); }} }}
-        .s-btn {{ background:var(--accent); color:#fff; border:none; padding:0 24px; border-radius:8px; font-weight:800; cursor:pointer; transition:0.2s; white-space:nowrap; }}
-        .s-btn:hover {{ background:var(--accent-hover); transform:scale(1.02); }}
-        
-        .s-row-2 {{ display: flex; gap: 10px; flex-wrap:wrap; align-items:center; }}
-        .cdd-wrap {{ position: relative; background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; cursor: pointer; font-weight: 700; font-size: 13px; color: var(--text); flex: 1; min-width: 100px; display: flex; justify-content: space-between; align-items: center; user-select: none; transition:0.2s; }}
-        .cdd-wrap:hover {{ border-color: var(--accent); }}
-        .cdd-menu {{ position: absolute; top: calc(100% + 5px); left: 0; right: 0; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; z-index: 100; display: none; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }}
-        .cdd-item {{ padding: 10px 14px; border-bottom: 1px solid var(--border); transition: 0.2s; }}
-        .cdd-item:last-child {{ border-bottom: none; }}
-        .cdd-item:hover {{ background: var(--bg3); color: var(--accent); }}
-        
-        .pg-bar {{ display:flex; justify-content:center; align-items:center; gap:15px; margin-top:30px; }}
-        .pg-btn {{ background:var(--bg4); color:var(--text); border:1px solid var(--border); padding:8px 20px; border-radius:6px; font-weight:700; cursor:pointer; font-size:13px; transition:0.2s; }}
-        .pg-btn:hover:not(:disabled) {{ background:var(--accent); color:#fff; border-color:var(--accent); }}
-        .pg-btn:disabled {{ opacity:0.4; cursor:not-allowed; }}
-        .pg-info {{ color:var(--text); font-weight:800; font-size:14px; background:var(--bg3); padding:6px 14px; border-radius:6px; border:1px solid var(--border); }}
-        
-        /* 📄 Text View mode */
-        .card-body {{ display: none; }}
-        .grid-text-mode .poster-wrap {{ display: none !important; }}
-        .grid-text-mode .act-card {{ display:flex; align-items:center; padding:5px; background:var(--card); }}
-        .grid-text-mode .card-body {{ display: block !important; text-align:left !important; padding:10px 15px !important; flex:1; }}
-        
-    </style>
+    {DIRECTORY_CSS}
 
     <div class="search-box">
         <div class="s-row-1" id="dirSearchRow">
@@ -245,7 +203,7 @@ async def api_directory_search(req):
         
     try:
         docs = await actors.find(query).sort("created_at", -1).skip(offset).limit(lim + 1).to_list(length=lim + 1)
-    except Exception as e:
+    except Exception:
         docs = []
     
     has_next = len(docs) > lim
@@ -336,7 +294,6 @@ async def get_actor_photo(req):
         del file_data
         return web.Response(body=body_bytes, content_type="image/jpeg", headers=headers)
     except Exception: return web.Response(status=500)
-    finally: gc.collect()
 
 
 # ─────────────────────────────────────────────────────────
@@ -395,7 +352,9 @@ async def api_actor_search_handler(req):
     role, _ = await get_auth(req)
     if not role: return web.json_response({"error": "Unauthorized"}, status=403, dumps=fast_json)
     actor_id, q_custom = req.query.get("id"), req.query.get("q", "").strip()
-    off, col, mode = req.query.get("offset", "0"), req.query.get("col", "all").lower(), req.query.get("mode", "tg").lower()
+    # नोट: `mode` query-param अब पढ़ा नहीं जाता — इस handler में thumbnail हमेशा
+    # tg_thumb के तौर पर भेजा जाता है, इसलिए variable bind करना dead code था।
+    off, col = req.query.get("offset", "0"), req.query.get("col", "all").lower()
     
     if not actor_id: return web.json_response({"results": []}, dumps=fast_json)
     try: off = max(0, int(off))

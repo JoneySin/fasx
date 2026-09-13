@@ -39,8 +39,16 @@ COLLECTIONS = {
     "primary": primary,
     "cloud":   cloud,
     "archive": archive,
-    "actors":  actors,   
+    "actors":  actors,
 }
+
+# ✅ DRY: COLLECTIONS में "actors" भी है, पर उसका schema फाइलों जैसा (file_ref /
+# file_name / thumb_url) नहीं है। इसलिए ensure_indexes(), delete_files() और
+# warmup.py — तीनों में अलग-अलग `if name == "actors": continue` लिखा गया था
+# (warmup.py में दो बार)। एक जगह छूट जाने पर actor के ObjectId को Telegram
+# file_id समझकर भेजने की कोशिश होती थी। अब सिर्फ़ file-schema वाले collections
+# का यह subset इस्तेमाल होता है, exclusion की कोई कॉपी नहीं बची।
+FILE_COLLECTIONS = {k: v for k, v in COLLECTIONS.items() if k != "actors"}
 
 # ⚡ GLOBAL STATUS EXPENSIVE COUNT CACHE
 _stats_cache = None
@@ -51,12 +59,9 @@ STATS_CACHE_TTL = 60
 # ⚡ INDEXES — Dynamic Configuration
 # ─────────────────────────────────────────────────────────
 async def ensure_indexes():
-    # 1. Files & Actors Indexes
-    for name, col in COLLECTIONS.items():
+    # 1. File-collection Indexes (actors का schema अलग है, उसके indexes नीचे बने हैं)
+    for name, col in FILE_COLLECTIONS.items():
         try:
-            if name == "actors":
-                continue
-
             if USE_CAPTION_FILTER:
                 await col.create_index([("file_name", "text"), ("caption", "text")], name=f"{name}_text")
             else:
@@ -116,6 +121,51 @@ async def db_count_documents():
         logger.error(f"Count Breakdown error: {e}")
         return {"primary": 0, "cloud": 0, "archive": 0, "total": 0, "primary_thumb": 0, "cloud_thumb": 0, "archive_thumb": 0, "total_thumb": 0}
 
+
+# ─────────────────────────────────────────────────────────
+# 🗂️ UNIVERSAL DIRECTORY COUNTS (actors / apps / websites)
+# ✅ DRY + FAST: यह 4-लाइन वाला ब्लॉक 3 जगह कॉपी था (commands./stats,
+# commands.ui_cb, web/stats_routes)। अब एक ही helper है, और तीनों count_documents
+# पहले sequentially चलते थे (3 round-trips) — अब asyncio.gather से parallel हैं,
+# यानी stats page/command पर ~2 round-trip का समय बचता है।
+# ─────────────────────────────────────────────────────────
+async def get_directory_counts():
+    """(total, actors, apps, websites) लौटाता है; DB फेल हो तो सब 0।"""
+    try:
+        total, apps, websites = await asyncio.gather(
+            actors.count_documents({}),
+            actors.count_documents({"category": "app"}),
+            actors.count_documents({"category": "website"}),
+        )
+        return total, total - apps - websites, apps, websites
+    except Exception as e:
+        logger.error(f"Directory Stats Error: {e}")
+        return 0, 0, 0, 0
+
+
+# ─────────────────────────────────────────────────────────
+# 📝 POSTS CMS CATEGORY COUNTS
+# ✅ DRY: यही aggregation commands.py (_get_post_stats) और web/stats_routes.py दोनों
+# में अलग-अलग लिखी थी। पूरा array RAM में लोड करने की बजाय MongoDB ही group-by
+# करता है। posts collection handle भी अब एक ही है (web/post_routes.py पहले अपना
+# अलग `motor_db.db["Posts"]` बनाता था)।
+# ─────────────────────────────────────────────────────────
+async def get_post_category_counts():
+    """(total, movies, web_series, app_video, adult) लौटाता है।"""
+    counts = {}
+    try:
+        pipeline = [{"$group": {"_id": {"$ifNull": ["$category", "Uncategorized"]},
+                                "count": {"$sum": 1}}}]
+        async for doc in posts.aggregate(pipeline):
+            counts[doc["_id"]] = doc["count"]
+    except Exception as e:
+        logger.error(f"Post Stats Error: {e}")
+    return (sum(counts.values()),
+            counts.get("Movies", 0),
+            counts.get("Web Series", 0),
+            counts.get("App Video", 0),
+            counts.get("Porn", 0))
+
 # ─────────────────────────────────────────────────────────
 # 💾 SAVE FILE
 # ─────────────────────────────────────────────────────────
@@ -167,40 +217,79 @@ def _build_regex(query: str):
     except Exception: return re.compile(re.escape(query), flags=re.IGNORECASE)
 
 # ─────────────────────────────────────────────────────────
+# 📑 SHARED PROJECTION (पहले यह 7 जगह हुबहू टाइप किया गया था)
+# ─────────────────────────────────────────────────────────
+FILE_PROJECTION = {"_id": 1, "file_name": 1, "file_size": 1, "file_type": 1,
+                   "file_ref": 1, "caption": 1, "thumb_url": 1}
+FILE_PROJECTION_SCORED = {**FILE_PROJECTION, "score": {"$meta": "textScore"}}
+
+# ─────────────────────────────────────────────────────────
+# 🧩 QUERY → MONGO FILTER BUILDER (single source of truth)
+# ✅ DRY: यह वही logic है जो पहले _search() और get_search_results() दोनों में
+# अलग-अलग लिखा था (clean_query → strict_query → $text, वरना regex $or, और lang
+# होने पर $and wrap)। दोनों copies में कभी भी divergence हो सकता था — यानी bot
+# और web एक ही query पर अलग filter चला सकते थे। अब एक ही जगह बनता है।
+# ─────────────────────────────────────────────────────────
+def _strict_text_query(raw_query: str) -> str:
+    """quotes हटाकर हर शब्द को individually quoted strict $text query बनाता है"""
+    clean = (raw_query or "").replace('"', '').replace("'", "").strip()
+    words = clean.split()
+    return " ".join(f'"{w}"' for w in words)
+
+def build_query_filter(raw_query: str, regex, lang=None):
+    """(mongo_filter, is_text_search) लौटाता है; कुछ भी match न बन पाए तो (None, False)"""
+    strict_query = _strict_text_query(raw_query)
+    if strict_query:
+        flt = {"$text": {"$search": strict_query}}
+        if lang:
+            flt = {"$and": [flt, {"file_name": re.compile(lang, re.IGNORECASE)}]}
+        return flt, True
+
+    if regex:
+        flt = ({"$or": [{"file_name": regex}, {"caption": regex}]}
+               if USE_CAPTION_FILTER else {"file_name": regex})
+        if lang:
+            flt = {"$and": [flt, {"file_name": re.compile(lang, re.IGNORECASE)}]}
+        return flt, False
+
+    return None, False
+
+def _tag_docs(docs, col_name: str):
+    """हर doc पर file_id/source_col भरता है (UI/JSON दोनों को चाहिए)"""
+    for doc in docs:
+        doc["file_id"] = doc["_id"]
+        doc["source_col"] = col_name
+    return docs
+
+# ─────────────────────────────────────────────────────────
 # 🚀 SMART SEARCH
 # ─────────────────────────────────────────────────────────
 async def _search(col, raw_query: str, regex, offset: int, limit: int, lang=None, bypass_count=False):
-    clean_query = raw_query.replace('"', '').replace("'", "").strip()
-    words = clean_query.split() if clean_query else []
-    strict_query = " ".join(f'"{word}"' for word in words) if words else ""
+    flt, is_text = build_query_filter(raw_query, regex, lang)
+    if not flt:
+        return [], 0
 
-    if strict_query:
-        text_flt = {"$text": {"$search": strict_query}}
-        if lang: text_flt = {"$and": [text_flt, {"file_name": re.compile(lang, re.IGNORECASE)}]}
+    col_name = col.name.lower()
 
-        cursor = col.find(text_flt, {"_id": 1, "file_name": 1, "file_size": 1, "file_type": 1, "file_ref": 1, "caption": 1, "thumb_url": 1, "score": {"$meta": "textScore"}})
-        cursor.sort([("score", {"$meta": "textScore"})])
+    if is_text:
+        cursor = col.find(flt, FILE_PROJECTION_SCORED).sort([("score", {"$meta": "textScore"})])
         cursor.skip(offset).limit(limit)
         docs = await cursor.to_list(length=limit)
         if docs:
-            for doc in docs: 
-                doc["file_id"] = doc["_id"] 
-                doc["source_col"] = col.name.lower()
-            count = 0 if bypass_count else await col.count_documents(text_flt)
+            _tag_docs(docs, col_name)
+            count = 0 if bypass_count else await col.count_documents(flt)
             return docs, count
+        # text-search खाली आया तो नीचे regex fallback चलता है
+        flt, is_text = build_query_filter("", regex, lang)
+        if not flt:
+            return [], 0
 
-    if not regex: return [], 0
-    reg_flt = {"$or": [{"file_name": regex}, {"caption": regex}]} if USE_CAPTION_FILTER else {"file_name": regex}
-    if lang: reg_flt = {"$and": [reg_flt, {"file_name": re.compile(lang, re.IGNORECASE)}]}
-
-    cursor = col.find(reg_flt, {"_id": 1, "file_name": 1, "file_size": 1, "file_type": 1, "file_ref": 1, "caption": 1, "thumb_url": 1}).sort('_id', -1)
+    cursor = col.find(flt, FILE_PROJECTION).sort('_id', -1)
     cursor.skip(offset).limit(limit)
     docs = await cursor.to_list(length=limit)
-    for doc in docs: 
-        doc["file_id"] = doc["_id"]
-        doc["source_col"] = col.name.lower()
+    _tag_docs(docs, col_name)
 
-    count = 0 if bypass_count else (await col.count_documents(reg_flt) if docs else 0)
+    count = 0 if bypass_count else (await col.count_documents(flt) if docs else 0)
     return docs, count
 
 async def get_count(col, flt, bypass):
@@ -215,28 +304,15 @@ async def get_search_results(query, max_results, offset=0, lang=None, collection
     raw_query  = str(query).strip()
     regex      = _build_regex(raw_query)
 
-    if not raw_query.replace('"', '').replace("'", "").strip().split() and not regex:
+    # ✅ DRY: पहले यहाँ query-cleaning दोबारा inline लिखी थी; अब वही shared
+    # build_query_filter() इस्तेमाल होता है जो _search() भी use करता है।
+    flt, is_text = build_query_filter(raw_query, regex, lang)
+    if not flt:
         return [], "", 0, collection_type
 
     results, total, actual_src = [], 0, collection_type
 
     if collection_type == "all":
-        clean_query = raw_query.replace('"', '').replace("'", "").strip()
-        words = clean_query.split() if clean_query else []
-        strict_query = " ".join(f'"{word}"' for word in words) if words else ""
-
-        flt = None
-        is_text = False
-
-        if strict_query:
-            is_text = True
-            text_flt = {"$text": {"$search": strict_query}}
-            flt = {"$and": [text_flt, {"file_name": re.compile(lang, re.IGNORECASE)}]} if lang else text_flt
-        elif regex:
-            reg_flt = {"$or": [{"file_name": regex}, {"caption": regex}]} if USE_CAPTION_FILTER else {"file_name": regex}
-            flt = {"$and": [reg_flt, {"file_name": re.compile(lang, re.IGNORECASE)}]} if lang else reg_flt
-
-        if not flt: return [], "", 0, collection_type
 
         # ✅ FIX: filter.py (bot साइड) पहले से computed counts (cached_counts) भेजता है
         # ताकि सिर्फ़ page बदलने पर तीनों collections को दोबारा count_documents ना
@@ -272,6 +348,7 @@ async def get_search_results(query, max_results, offset=0, lang=None, collection
 
         rem_limit = max_results
         curr_offset = offset
+        projection = FILE_PROJECTION_SCORED if is_text else FILE_PROJECTION
 
         for col, cnt in [(primary, cnt_p), (cloud, cnt_c), (archive, cnt_a)]:
             if cnt == 0 or rem_limit <= 0: continue
@@ -280,19 +357,12 @@ async def get_search_results(query, max_results, offset=0, lang=None, collection
                 curr_offset -= cnt
                 continue
 
-            cursor = col.find(flt, {"_id": 1, "file_name": 1, "file_size": 1, "file_type": 1, "file_ref": 1, "caption": 1, "thumb_url": 1})
-            if is_text:
-                cursor = cursor.sort([("score", {"$meta": "textScore"})])
-            else:
-                cursor = cursor.sort('_id', -1)
-
+            cursor = col.find(flt, projection)
+            cursor = cursor.sort([("score", {"$meta": "textScore"})]) if is_text else cursor.sort('_id', -1)
             cursor.skip(curr_offset).limit(rem_limit)
             docs = await cursor.to_list(length=rem_limit)
 
-            for doc in docs:
-                doc["file_id"] = doc["_id"]
-                doc["source_col"] = col.name.lower()
-            results.extend(docs)
+            results.extend(_tag_docs(docs, col.name.lower()))
 
             rem_limit -= len(docs)
             curr_offset = 0
@@ -334,6 +404,26 @@ def _clean_title_guess(file_name: str) -> str:
     if not file_name: return ""
     return re.sub(r'\s+', ' ', file_name).strip()
 
+
+def _dedupe_titles(docs, limit: int, seen: set):
+    """docs से unique, non-empty titles निकालता है (case-insensitive dedupe)।
+
+    ✅ DRY: यह 8-लाइन वाला loop get_db_spell_suggestions() में दो बार हुबहू लिखा
+    था (text-search candidates और prefix-fallback candidates के लिए)। `seen` को
+    in-place update करता है ताकि दोनों चरणों में dedupe आपस में जुड़ा रहे।
+    """
+    out = []
+    for doc in docs:
+        title = _clean_title_guess(doc.get("file_name", ""))
+        key = title.lower()
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        out.append(title)
+        if len(out) >= limit:
+            break
+    return out
+
 async def get_db_spell_suggestions(query, limit=5, collection_type="all"):
     q = str(query or "").strip()
     if not q: return []
@@ -366,16 +456,7 @@ async def get_db_spell_suggestions(query, limit=5, collection_type="all"):
 
     candidates.sort(key=lambda d: d.get("score", 0), reverse=True)
 
-    suggestions = []
-    for doc in candidates:
-        title = _clean_title_guess(doc.get("file_name", ""))
-        key = title.lower()
-        if not title or key in seen:
-            continue
-        seen.add(key)
-        suggestions.append(title)
-        if len(suggestions) >= limit:
-            break
+    suggestions = _dedupe_titles(candidates, limit, seen)
 
     # ✅ FIX: पूरी तरह अनजान/बिगड़ा हुआ query (जैसे "Hootx") पर ऊपर वाला
     # stemmed $text search भी कभी-कभी कुछ नहीं देता (कोई शब्द match ही नहीं
@@ -404,15 +485,7 @@ async def get_db_spell_suggestions(query, limit=5, collection_type="all"):
                 continue
             prefix_candidates.extend(res)
 
-        for doc in prefix_candidates:
-            title = _clean_title_guess(doc.get("file_name", ""))
-            key = title.lower()
-            if not title or key in seen:
-                continue
-            seen.add(key)
-            suggestions.append(title)
-            if len(suggestions) >= limit:
-                break
+        suggestions.extend(_dedupe_titles(prefix_candidates, limit - len(suggestions), seen))
 
     return suggestions
 
@@ -422,7 +495,7 @@ async def get_db_spell_suggestions(query, limit=5, collection_type="all"):
 # — सबसे नई अपलोड की गई फाइलें, ताकि पेज खाली ना लगे)
 # ─────────────────────────────────────────────────────────
 async def get_recent_files(max_results, offset=0, collection_type="all"):
-    proj = {"_id": 1, "file_name": 1, "file_size": 1, "file_type": 1, "file_ref": 1, "caption": 1, "thumb_url": 1, "added_on": 1}
+    proj = {**FILE_PROJECTION, "added_on": 1}
 
     if collection_type == "all":
         take = offset + max_results + 1  # +1 ताकि has_more पता चल सके
@@ -468,7 +541,7 @@ async def _backup_before_delete(doc):
     if not file_ref:
         return
     caption = f"🗑 <b>Deleted File Backup</b>\n\n📄 <code>{doc.get('file_name', 'Unknown')}</code>"
-    for attempt in range(2):  # 1 असली कोशिश + 1 FloodWait के बाद रिट्राई
+    for _attempt in range(2):  # 1 असली कोशिश + 1 FloodWait के बाद रिट्राई
         try:
             await temp.BOT.send_cached_media(chat_id=DELETE_CHANNEL, file_id=file_ref, caption=caption)
             return
@@ -482,7 +555,8 @@ async def _backup_before_delete(doc):
 async def delete_files(query, collection_type="all"):
     deleted = 0
     try:
-        cols = [col for name, col in COLLECTIONS.items() if (collection_type == "all" or name == collection_type) and name != "actors"]
+        cols = [col for name, col in FILE_COLLECTIONS.items()
+                if collection_type == "all" or name == collection_type]
 
         if query == "*":
             # ✅ /delete_all (पूरा collection wipe) — यहाँ DELETE_CHANNEL में बैकअप
@@ -532,7 +606,7 @@ async def delete_single_file(file_id, collection_type="primary"):
 async def get_file_details(file_id):
     try:
         for col in [primary, cloud, archive]:
-            doc = await col.find_one({"_id": file_id}, {"_id": 1, "file_name": 1, "file_size": 1, "file_ref": 1, "caption": 1, "thumb_url": 1})
+            doc = await col.find_one({"_id": file_id}, FILE_PROJECTION)
             if doc:
                 doc["file_id"] = doc["_id"]  
                 return doc
@@ -589,7 +663,7 @@ async def get_actor_search_results(actor_name, tags_list, max_results, offset=0,
     cols = [primary, cloud, archive] if collection_type == "all" else [COLLECTIONS.get(collection_type, primary)]
     
     for col in cols:
-        cursor = col.find(reg_flt, {"_id": 1, "file_name": 1, "file_size": 1, "file_type": 1, "file_ref": 1, "caption": 1, "thumb_url": 1}).sort('_id', -1)
+        cursor = col.find(reg_flt, FILE_PROJECTION).sort('_id', -1)
         cursor.skip(offset).limit(max_results)
         docs = await cursor.to_list(length=max_results)
         if docs:

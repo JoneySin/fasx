@@ -1,6 +1,5 @@
 import math
 import io
-import gc
 import logging
 from hydrogram import Client, utils, raw
 from hydrogram.types import Message
@@ -131,8 +130,6 @@ class TGCustomYield:
 
         except Exception as e:
             logger.error(f"Streaming error at offset {offset}: {e}")
-        finally:
-            gc.collect()
 
     # ─────────────────────────────────────────────────────────
     # 📥 BYTESIO PIPELINE — thumbnail / small file download
@@ -167,5 +164,4 @@ class TGCustomYield:
             logger.error(f"download_as_bytesio error: {e}")
 
         buf.seek(0)
-        gc.collect()
         return buf

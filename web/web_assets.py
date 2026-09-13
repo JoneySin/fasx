@@ -1,8 +1,60 @@
 import time
+import orjson
 from aiohttp import web
 from info import ADMINS, MAX_WEB_RESULTS
 from utils import temp
 from database.users_chats_db import db as user_db
+
+# ─────────────────────────────────────────────
+# ⚡ SHARED JSON DUMPER
+# ✅ DRY: यह function पहले search_api.py, actor_routes.py और post_routes.py — तीनों
+# में अलग-अलग copy-paste था। तीनों route files यहाँ से import करती हैं।
+# ─────────────────────────────────────────────
+def fast_json(data):
+    """orjson बाइट्स (bytes) में डेटा देता है, aiohttp के लिए इसे स्ट्रिंग में डिकोड करना होता है"""
+    return orjson.dumps(data).decode('utf-8')
+
+# ─────────────────────────────────────────────
+# 🎨 SHARED DIRECTORY CSS
+# ✅ DRY: /actors और /posts दोनों grid pages में यह ~24-rule CSS ब्लॉक हुबहू कॉपी
+# था। एक जगह भी class बदलने पर दूसरा पेज टूट जाता। अब दोनों इसी को embed करते हैं।
+# ─────────────────────────────────────────────
+DIRECTORY_CSS = """
+    <style>
+        .dir-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+        @media(min-width: 768px) { .dir-grid { grid-template-columns: repeat(5, 1fr); gap: 20px; } }
+
+        .search-box { background:var(--card); border:1px solid var(--border); padding:16px; border-radius:12px; margin-bottom:25px; box-shadow:0 4px 15px rgba(0,0,0,0.1); }
+        .s-row-1 { display: flex; gap: 10px; margin-bottom: 12px; position: relative; }
+        .s-input { flex: 1; background:var(--bg3); border:1px solid var(--border); padding:12px 16px; color:var(--text); border-radius:8px; outline:none; font-family:inherit; font-weight:600; font-size:14px; transition:0.2s; }
+        .s-input:focus { border-color:var(--accent); }
+        .s-spinner { display:none; position:absolute; right:14px; top:50%; transform:translateY(-50%); width:16px; height:16px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:sSpin .6s linear infinite; }
+        .s-row-1.loading .s-spinner { display:block; }
+        @keyframes sSpin { to { transform:translateY(-50%) rotate(360deg); } }
+        .s-btn { background:var(--accent); color:#fff; border:none; padding:0 24px; border-radius:8px; font-weight:800; cursor:pointer; transition:0.2s; white-space:nowrap; }
+        .s-btn:hover { background:var(--accent-hover); transform:scale(1.02); }
+
+        .s-row-2 { display: flex; gap: 10px; flex-wrap:wrap; align-items:center; }
+        .cdd-wrap { position: relative; background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; cursor: pointer; font-weight: 700; font-size: 13px; color: var(--text); flex: 1; min-width: 100px; display: flex; justify-content: space-between; align-items: center; user-select: none; transition:0.2s; }
+        .cdd-wrap:hover { border-color: var(--accent); }
+        .cdd-menu { position: absolute; top: calc(100% + 5px); left: 0; right: 0; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; z-index: 100; display: none; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+        .cdd-item { padding: 10px 14px; border-bottom: 1px solid var(--border); transition: 0.2s; }
+        .cdd-item:last-child { border-bottom: none; }
+        .cdd-item:hover { background: var(--bg3); color: var(--accent); }
+
+        .pg-bar { display:flex; justify-content:center; align-items:center; gap:15px; margin-top:30px; }
+        .pg-btn { background:var(--bg4); color:var(--text); border:1px solid var(--border); padding:8px 20px; border-radius:6px; font-weight:700; cursor:pointer; font-size:13px; transition:0.2s; }
+        .pg-btn:hover:not(:disabled) { background:var(--accent); color:#fff; border-color:var(--accent); }
+        .pg-btn:disabled { opacity:0.4; cursor:not-allowed; }
+        .pg-info { color:var(--text); font-weight:800; font-size:14px; background:var(--bg3); padding:6px 14px; border-radius:6px; border:1px solid var(--border); }
+
+        /* 📄 Text View mode overrides */
+        .card-body { display: none; }
+        .grid-text-mode .poster-wrap { display: none !important; }
+        .grid-text-mode .act-card { display:flex; align-items:center; padding:5px; background:var(--card); }
+        .grid-text-mode .card-body { display: block !important; text-align:left !important; padding:10px 15px !important; flex:1; }
+    </style>
+"""
 
 # ----------------- ULTRA-PREMIUM GLASS DIAGNOSTICS ASSETS -----------------
 CSS = """
@@ -274,8 +326,9 @@ def _h(html): return web.Response(text=html.encode('utf-8','replace').decode('ut
 
 async def get_auth(req):
     s_user = req.cookies.get('user_session')
-    if s_user and hasattr(temp, 'USER_SESSIONS') and s_user in temp.USER_SESSIONS and temp.USER_SESSIONS[s_user]['expiry'] > time.time():
-        tg_id = temp.USER_SESSIONS[s_user]['tg_id']
+    session = temp.USER_SESSIONS.get(s_user) if s_user else None
+    if session and session['expiry'] > time.time():
+        tg_id = session['tg_id']
         if tg_id in ADMINS: return 'admin', tg_id
         return 'user', tg_id
     return None, None
@@ -292,51 +345,97 @@ async def require_active_plan(role, tg_id):
     mp = await user_db.get_plan(tg_id)
     return bool(mp.get("premium"))
 
-def build_page(title, body, cls="", active_tab="", role=None):
-    if role == 'admin': 
-        nav_links = f'<a href="/dashboard" class="sb-link {"active" if active_tab=="dash" else ""}">Home</a><a href="/posts" class="sb-link {"active" if active_tab=="posts" else ""}">📝 Posts</a><a href="/actors" class="sb-link {"active" if active_tab=="actors" else ""}">🎭 Actors</a><a href="/stats" class="sb-link {"active" if active_tab=="stats" else ""}">Database Stats</a><a href="/profile" class="sb-link {"active" if active_tab=="profile" else ""}">Profile Settings</a>'
-    elif role == 'user': 
-        nav_links = f'<a href="/dashboard" class="sb-link {"active" if active_tab=="dash" else ""}">Home</a><a href="/posts" class="sb-link {"active" if active_tab=="posts" else ""}">📝 Posts</a><a href="/actors" class="sb-link {"active" if active_tab=="actors" else ""}">🎭 Actors</a><a href="/profile" class="sb-link {"active" if active_tab=="profile" else ""}">Profile Settings</a>'
-    else: 
-        nav_links = ""
+# ✅ DRY: पहले admin/user के लिए दो अलग 1-लाइनर nav_links f-strings थीं जिनमें
+# चार लिंक हुबहू दोहराए गए थे (सिर्फ़ "Database Stats" admin-only था) — एक लिंक का label/
+# href बदलना हो तो दोनों लाइनें edit करनी पड़ती थीं। अब एक ही menu list से बनता है।
+NAV_MENU = (
+    ("dash",   "/dashboard", "Home"),
+    ("posts",  "/posts",     "📝 Posts"),
+    ("actors", "/actors",    "🎭 Actors"),
+    ("stats",  "/stats",     "Database Stats"),
+    ("profile", "/profile",  "Profile Settings"),
+)
 
-    if role: nav = f'<div class="sidebar-overlay" id="sbOverlay" onclick="closeSidebar()"></div><div class="sidebar" id="sidebar"><div class="sb-header"><div class="sb-logo"><span class="nf-icon">F</span> FAST FINDER</div><button class="sb-close" onclick="closeSidebar()">&#10005;</button></div><nav class="sb-nav"><div class="sb-section">Menu</div>{nav_links}</nav><div class="sb-footer"><a href="/logout" class="sb-logout">Sign Out</a></div></div><div class="topbar"><button class="ham-btn" id="hamBtn" onclick="openSidebar()"><span class="ham-line"></span><span class="ham-line"></span><span class="ham-line"></span></button><a class="logo" href="/dashboard"><span class="nf-icon">F</span> FAST FINDER</a><div class="topbar-right"><button class="theme-btn" onclick="toggleThemeFixed()">Theme</button></div></div>'
-    else: nav = '<div class="topbar" style="position:absolute; width:100%; box-shadow:none; background:transparent;"><a class="logo" href="/" style="font-size:24px"><span class="nf-icon" style="font-size:24px">F</span> FAST FINDER</a><div class="topbar-right"><button class="theme-btn" onclick="toggleThemeFixed()">Theme</button></div></div>'
+# ⚡ FAST: head का static हिस्सा (fonts + ~25KB CSS + JS) module-load पर एक ही बार
+# बन जाता है। पहले build_page() हर request पर पूरा CSS/JS दोबारा f-string में
+# इंटरपोलेट करके नई string बनाता था — यानी हर page-view पर ~25KB की बेकार
+# allocation + copy। अब सिर्फ़ title/body जुड़ते हैं।
+_HEAD_PRE = '<!DOCTYPE html><html><head>'
+_HEAD_POST = (
+    '</title><meta name="viewport" content="width=device-width,initial-scale=1">'
+    '<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;900&display=swap" rel="stylesheet">'
+    '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.1/cropper.min.css">'
+    f'<style>{CSS}</style>'
+    '<script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.1/cropper.min.js"></script>'
+    f'<script>{JS}</script></head>'
+)
 
-    modals = """
+# Admin-only edit modal भी constant है — हर request पर दोबारा evaluate करने की ज़रूरत नहीं
+_ADMIN_MODALS = """
     <div class="edit-modal" id="editCombinedModal" onclick="if(event.target===this)closeCombinedModal()">
         <div class="em-card">
             <button class="em-close" onclick="closeCombinedModal()">&#10005;</button>
             <div class="em-title">✏️ Edit Title Metadata</div>
-            
+
             <div class="scard-label">File Name</div>
             <input type="text" id="emName" class="em-input">
-            
+
             <div class="scard-label" style="margin-top:5px;">➕ Add Search Tags to Caption (Optional)</div>
             <input type="text" id="emAddCaption" class="em-input" placeholder="e.g. Ajay Devgan, 1080p, Comedy...">
-            
+
             <div class="scard-label">📂 Move File to Collection</div>
             <select id="emMoveCol" class="em-input" style="font-weight:600; cursor:pointer;">
                 <option value="primary">🟢 Primary</option>
                 <option value="cloud">🔵 Cloud</option>
                 <option value="archive">🟠 Archive</option>
             </select>
-            
+
             <div class="scard-label" style="margin-top:5px;">Poster Thumbnail (YouTube Studio Mode)</div>
             <div class="thumb-preview-box" id="emPreviewBox"></div>
             <div class="cropper-container-box" id="cropContainer"></div>
-            
+
             <label class="em-upload-btn">
                 📂 Choose New Image / Poster
                 <input type="file" id="emFile" accept="image/*" style="display:none;" onchange="handleLocalPreview(this)">
             </label>
-            
+
             <button class="em-save-btn" id="emSaveBtn" onclick="saveAllChanges()">Save Changes</button>
         </div>
     </div>
-    """ if role == 'admin' else ""
+    """
 
-    return _h(f'<!DOCTYPE html><html><head><title>{title}</title><meta name="viewport" content="width=device-width,initial-scale=1"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;900&display=swap" rel="stylesheet"><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.1/cropper.min.css"><style>{CSS}</style><script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.1/cropper.min.js"></script><script>{JS}</script></head><body class="{cls}">{nav}{body}{modals}</body></html>')
+_NAV_SHELL = ('<div class="sidebar-overlay" id="sbOverlay" onclick="closeSidebar()"></div>'
+    '<div class="sidebar" id="sidebar"><div class="sb-header"><div class="sb-logo">'
+    '<span class="nf-icon">F</span> FAST FINDER</div>'
+    '<button class="sb-close" onclick="closeSidebar()">&#10005;</button></div>'
+    '<nav class="sb-nav"><div class="sb-section">Menu</div>{links}</nav>'
+    '<div class="sb-footer"><a href="/logout" class="sb-logout">Sign Out</a></div></div>'
+    '<div class="topbar"><button class="ham-btn" id="hamBtn" onclick="openSidebar()">'
+    '<span class="ham-line"></span><span class="ham-line"></span><span class="ham-line"></span></button>'
+    '<a class="logo" href="/dashboard"><span class="nf-icon">F</span> FAST FINDER</a>'
+    '<div class="topbar-right"><button class="theme-btn" onclick="toggleThemeFixed()">Theme</button></div></div>')
+
+_NAV_GUEST = ('<div class="topbar" style="position:absolute; width:100%; box-shadow:none; background:transparent;">'
+    '<a class="logo" href="/" style="font-size:24px"><span class="nf-icon" style="font-size:24px">F</span> FAST FINDER</a>'
+    '<div class="topbar-right"><button class="theme-btn" onclick="toggleThemeFixed()">Theme</button></div></div>')
+
+
+def build_page(title, body, cls="", active_tab="", role=None):
+    if role:
+        links = "".join(
+            f'<a href="{href}" class="sb-link {"active" if active_tab == tab else ""}">{label}</a>'
+            for tab, href, label in NAV_MENU
+            if role == "admin" or tab != "stats"   # Database Stats admin-only है
+        )
+        nav = _NAV_SHELL.format(links=links)
+    else:
+        nav = _NAV_GUEST
+
+    modals = _ADMIN_MODALS if role == 'admin' else ""
+
+    return _h(_HEAD_PRE + '<title>' + title + _HEAD_POST
+              + f'<body class="{cls}">' + nav + body + modals + '</body></html>')
+
 
 def form_wrapper(title, content, err="", msg=""):
     e = f'<div class="err-box">{err}</div>' if err else ""

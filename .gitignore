@@ -1,0 +1,30 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments / secrets
+.env
+.env.*
+venv/
+.venv/
+
+# Logs
+*.log
+
+# ⚠️ Telegram Session Files
+*.session
+*.session-journal
+
+# IDE & OS Files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Bot Specific
+restart.txt
+downloads/
+users.txt
+chats.txt

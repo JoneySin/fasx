@@ -9,7 +9,7 @@ from lru import LRU  # ✅ LRU-Dict imported for Auto-Pilot RAM Management
 from hydrogram import Client, filters, enums
 from hydrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from info import ADMINS, DELETE_TIME, MAX_BOT_RESULTS, IS_PREMIUM, PICS, SPELL_CHECK
+from info import ADMINS, MAX_BOT_RESULTS, IS_PREMIUM, PICS, SPELL_CHECK
 from utils import is_premium, get_size, is_check_admin, temp, get_settings, save_group_settings
 from database.ia_filterdb import get_search_results, get_db_spell_suggestions
 from database.users_chats_db import db
@@ -34,7 +34,7 @@ ACTIVE_DELETE_TASKS = {}
 # ⚡ AGGRESSIVE RAM PROTECTION (Koyeb Free Tier Safe Guard)
 def check_cache_limit():
     """चूंकि BUTTONS अब LRU से ऑटो-कंट्रोल हो रहा है, हम सिर्फ temp.FILES को फ्लश करेंगे"""
-    if hasattr(temp, "FILES") and len(temp.FILES) > 300:
+    if len(temp.FILES) > 300:
         temp.FILES.clear()
         gc.collect()
         logger.info("🧹 Auto-Pilot RAM Cleaned: temp.FILES Flushed Successfully.")
@@ -375,16 +375,35 @@ async def auto_filter(client, msg, collection_type="all", settings=None):
 # ─────────────────────────────────────────────
 # 📤 CALLBACK HANDLERS
 # ─────────────────────────────────────────────
+# ✅ BUG FIX (duplicate handler): `^close_` regex पर दो अलग-अलग handlers रजिस्टर थे —
+# यहाँ close_callback और plugins/commands.py में close_cb। hydrogram दोनों को एक ही
+# callback पर चलाता था, यानी हर "❌ Close" tap पर delete_messages दो बार चलता,
+# दूसरी बार हमेशा MessageDeleteForbidden/MessageIdInvalid exception देता, और दोनों
+# अपनी-अपनी सफाई करते थे (एक PM_FILES देखता, दूसरा auto-delete timer)।
+# अब एक ही merged handler है जो दोनों की पूरी सफाई करता है, और साथ में search
+# result cache (temp.FILES / BUTTONS) भी रिलीज़ करता है — पहले वो close के बाद
+# LRU eviction तक RAM में टिका रहता था।
 @Client.on_callback_query(filters.regex(r"^close_"))
 async def close_callback(client, query):
     try:
+        # `close_data` (index cancel बटन) पर कोई owner चेक नहीं, `close_<uid>` पर है
+        parts = query.data.split("_")
+        if len(parts) > 1 and parts[1].isdigit() and int(parts[1]) != query.from_user.id:
+            return await query.answer("❌ You cannot close this result!", show_alert=True)
+
         chat_id = query.message.chat.id
         current_msg_id = query.message.id
-        
+
+        # 1. इस मैसेज पर चल रहा auto-delete टाइमर रोकें (वरना बाद में बेकार API कॉल)
         task_key = f"{chat_id}_{current_msg_id}"
-        if task_key in ACTIVE_DELETE_TASKS:
-            ACTIVE_DELETE_TASKS[task_key].cancel()
-            ACTIVE_DELETE_TASKS.pop(task_key, None)
+        task = ACTIVE_DELETE_TASKS.pop(task_key, None)
+        if task:
+            task.cancel()
+
+        # 2. सर्च-रिज़ल्ट कैशे रिलीज़ करें
+        search_key = f"{chat_id}-{current_msg_id}"
+        temp.FILES.pop(search_key, None)
+        BUTTONS.pop(search_key, None)
 
         # ✅ BUG FIX: अंधे की तरह -1/+1 डिलीट करने के बजाय सिर्फ बोट रिस्पांस और मूल यूज़र क्वेरी को ही डिलीट करें
         msg_ids_to_clean = [current_msg_id]
@@ -392,16 +411,23 @@ async def close_callback(client, query):
             msg_ids_to_clean.append(query.message.reply_to_message.id)
         elif getattr(query.message, "reply_to_message_id", None):
             msg_ids_to_clean.append(query.message.reply_to_message_id)
-        
+
+        # 3. PM में भेजी गई फाइल + उसका "will delete in..." नोट भी साथ में साफ़ करें
+        for k, v in list(temp.PM_FILES.items()):
+            if v.get('file_msg') == current_msg_id or k == current_msg_id:
+                if v.get('note_msg'):
+                    msg_ids_to_clean.append(v['note_msg'])
+                del temp.PM_FILES[k]
+                break
+
+        msg_ids_to_clean = [m for m in msg_ids_to_clean if m]
         for mid in msg_ids_to_clean:
             await db.remove_from_delete_queue(chat_id, mid)
-            
+
         await client.delete_messages(chat_id, msg_ids_to_clean)
     except Exception:
         try: await query.message.delete()
         except: pass
-    finally:
-        gc.collect()
 
 @Client.on_callback_query(filters.regex(r"^spellchk_"))
 async def spell_check_handler(client, query):
@@ -439,8 +465,6 @@ async def spell_check_handler(client, query):
     except Exception as e:
         logger.error(f"Spellcheck Callback Error: {e}")
         await query.answer("❌ Error during search!", show_alert=True)
-    finally:
-        gc.collect()
 
 # ─────────────────────────────────────────────
 # 🔄 PAGINATION & PERFECT TIMER RESET SYNCHRONIZER
@@ -492,4 +516,3 @@ async def pagination_handler(client, query):
         asyncio.create_task(start_auto_delete_timer(client, query.message.chat.id, query.message.id, delay=300))
         
     await query.answer()
-    gc.collect()

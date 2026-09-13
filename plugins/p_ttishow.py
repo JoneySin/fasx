@@ -53,7 +53,7 @@ async def welcome(c, m):
         
         # ✅ FIX: स्ट्रिक्ट प्रीमियम मॉडल पैच - अगर आने वाला मेंबर प्रीमियम नहीं है, तो उसे सूचित करें
         if IS_PREMIUM and new_user.id not in ADMINS and not await is_premium(new_user.id, c):
-            welcome_cap += f"\n\n🔒 <b>Notice:</b> This is an <u>Admin & Premium Only</u> automated group. Please type /plan in bot PM to unlock your search access."
+            welcome_cap += "\n\n🔒 <b>Notice:</b> This is an <u>Admin & Premium Only</u> automated group. Please type /plan in bot PM to unlock your search access."
             
         try:
             w_msg = await c.send_message(m.chat.id, welcome_cap)
@@ -79,7 +79,7 @@ async def restart_bot(c, m):
 
 @Client.on_message(filters.command(['leave', 'invite_link']) & filters.user(ADMINS))
 async def chat_actions(c, m):
-    if len(m.command) < 2: return await m.reply(f'Usage: `/{m.command[0]} chat_id`')
+    if len(m.command) < 2: return await m.reply(f"Usage: `/{m.command[0]} chat_id`")
     try:
         cid = int(m.command[1])
         if m.command[0] == 'leave':

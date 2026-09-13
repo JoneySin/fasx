@@ -1,6 +1,7 @@
 import logging
 import hashlib
 import random
+import time
 from datetime import datetime, timedelta
 import pytz
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -16,6 +17,29 @@ def get_local_now():
     """info.py के TIME_ZONE के अनुसार लाइव लोकल टाइम देता है"""
     tz = pytz.timezone(TIME_ZONE)
     return datetime.now(tz)
+
+# =========================================
+# 💎 PREMIUM PLAN STATE — SINGLE SOURCE OF TRUTH
+# यही dict plan deactivate/reset होने पर लिखा जाता है। पहले यह पूरा 11-key वाला
+# ब्लॉक 5 अलग-अलग फाइलों में हुबहू कॉपी था (utils.is_premium, premium.check_
+# premium_expired, premium.manage_premium, premium.pay_action और यहाँ df_prm) —
+# एक भी reminder flag add/rename करना हो तो 5 जगह edit करना पड़ता था और एक जगह
+# छूट जाने पर plan "आधा reset" हो जाता था। अब हर जगह इसी को copy किया जाता है।
+# ⚠️ हमेशा dict(...) copy पास करें, कभी यह object सीधे mutate न करें।
+# =========================================
+DEFAULT_PLAN_STATUS = {
+    "expire": None,
+    "trial": False,
+    "plan": "",
+    "premium": False,
+    "reminded_12h": False,
+    "reminded_6h": False,
+    "reminded_3h": False,
+    "reminded_1h": False,
+    "reminded_30m": False,
+    "reminded_10m": False,
+    "last_reminder_id": 0,
+}
 
 # =========================================
 # 🌐 WEB AUTHENTICATION DATABASE (RAM Protected)
@@ -123,21 +147,10 @@ class Database:
 
     # ⚙️ Default Global Settings Config
     df_set = {"file_secure": PROTECT_CONTENT, "spell_check": SPELL_CHECK, "auto_delete": AUTO_DELETE, "caption": FILE_CAPTION, "search_enabled": True, "blacklist": [], "dlink": {}, "notes": {}}
-    
-    df_prm = {
-        "expire": None, 
-        "trial": False, 
-        "plan": "", 
-        "premium": False, 
-        "reminded_12h": False, 
-        "reminded_6h": False, 
-        "reminded_3h": False, 
-        "reminded_1h": False, 
-        "reminded_30m": False, 
-        "reminded_10m": False,
-        "last_reminder_id": 0
-    }
-    
+
+    # ✅ DRY: ऊपर वाले DEFAULT_PLAN_STATUS को ही base माना गया है (कॉपी नहीं, वही object)
+    df_prm = DEFAULT_PLAN_STATUS
+
     df_ban = {"is_banned": False, "ban_reason": ""}
     df_chat = {"is_disabled": False, "reason": ""}
 
@@ -278,14 +291,15 @@ class Database:
         try:
             from utils import temp
             ram_users = set()
-            
+
             # 1. Active Live RAM Sessions से एक्टिव टोकन्स स्कैन करें
-            if hasattr(temp, "USER_SESSIONS"):
-                import time
-                now = time.time()
-                for session_id, session_data in temp.USER_SESSIONS.items():
-                    if session_data.get("expiry", 0) > now:
-                        ram_users.add(session_data.get("tg_id"))
+            # ✅ FIX: पहले यहाँ `hasattr(temp, "USER_SESSIONS")` guard था, और
+            # USER_SESSIONS temp class में declared नहीं था — यानी पहली बार कोई login
+            # करने से पहले यह पूरा ब्लॉक चुपचाप skip हो जाता था। अब temp में declared है।
+            now = time.time()
+            for session_data in temp.USER_SESSIONS.values():
+                if session_data.get("expiry", 0) > now:
+                    ram_users.add(session_data.get("tg_id"))
 
             # 2. Database `web_users` कलेक्शन से पिछले 24 घंटे की लॉगिन हिस्ट्री चेक करें
             # ✅ BUG FIX: पहले यहाँ naive datetime.now() इस्तेमाल होता था, जबकि

@@ -1,12 +1,12 @@
+import asyncio
 from aiohttp import web
 from web.web_assets import build_page, get_auth
-# ✅ FIX: actors कलेक्शन को इम्पोर्ट किया गया ताकि हम प्रोफाइल्स गिन सकें
-from database.ia_filterdb import db_count_documents, actors
+# ✅ DRY: directory + post-category counts अब ia_filterdb के shared helpers से आते
+# हैं। पहले यहाँ actors.count_documents × 4 और posts aggregation खुद लिखी थी, और
+# वही ब्लॉक plugins/commands.py में भी (दो बार) कॉपी था — यानी 3 copies।
+from database.ia_filterdb import db_count_documents, get_directory_counts, get_post_category_counts
 from database.users_chats_db import db as user_db
 from info import PORT
-# ✅ NEW: post_routes.py में पहले से मौजूद posts_col को ही reuse किया,
-# दोबारा motor_db.db["Posts"] से नया collection object नहीं बनाया
-from web.post_routes import posts_col
 
 stats_routes = web.RouteTableDef()
 
@@ -106,60 +106,42 @@ async function triggerCacheFlush() {
 }
 </script>"""
 
+async def _get_total_plays():
+    """🎥 वेबसाइट/मिनी-ऐप पर कुल stream plays"""
+    stats_doc = await user_db.settings.find_one({"id": "global_stream_stats"}, {"total_web_plays": 1})
+    return stats_doc.get("total_web_plays", 0) if stats_doc else 0
+
+
 @stats_routes.get('/stats')
 async def stats(req):
     role, _ = await get_auth(req)
     if role != 'admin': return web.HTTPFound('/dashboard')
 
     default_s = {'total': 0, 'primary': 0, 'cloud': 0, 'archive': 0, 'primary_thumb': 0, 'cloud_thumb': 0, 'archive_thumb': 0, 'total_thumb': 0}
-    try:
-        s = await db_count_documents()
-        if not isinstance(s, dict): s = default_s
-    except: s = default_s
 
-    try: u = await user_db.total_users_count()
-    except: u = 0
+    async def _safe(coro, default):
+        """हर counter अलग-अलग fail-safe है — एक DB error पूरा /stats पेज नहीं गिराएगा"""
+        try:
+            return await coro
+        except Exception:
+            return default
 
-    # ─── 🎥 VIDEO PLAYS TRACK DATA ENGINE ───
-    try:
-        stats_doc = await user_db.settings.find_one({"id": "global_stream_stats"}, {"total_web_plays": 1})
-        total_plays = stats_doc.get("total_web_plays", 0) if stats_doc else 0
-    except:
-        total_plays = 0
+    # ⚡ FAST: ये सब counts एक-दूसरे से independent हैं, इसलिए पहले 10+ sequential
+    # round-trips की जगह अब सब parallel चलते हैं (stats पेज का मुख्य delay यही था)।
+    (s, u, total_plays, logged_in_today, premium_users,
+     (tot_dir, act_dir, app_dir, web_dir), post_stats) = await asyncio.gather(
+        _safe(db_count_documents(), default_s),
+        _safe(user_db.total_users_count(), 0),
+        _safe(_get_total_plays(), 0),
+        _safe(user_db.get_today_logged_in_users_count(), 0),
+        _safe(user_db.get_premium_users_count(), 0),
+        get_directory_counts(),
+        get_post_category_counts(),
+    )
+    if not isinstance(s, dict):
+        s = default_s
 
-    # ─── 📈 LIVE ADAPTIVE COUNTERS PIPELINE ───
-    try: logged_in_today = await user_db.get_today_logged_in_users_count()
-    except: logged_in_today = 0
-
-    try: premium_users = await user_db.get_premium_users_count()
-    except: premium_users = 0
-
-    # ─── 🗂️ UNIVERSAL DIRECTORY COUNTS ───
-    try:
-        tot_dir = await actors.count_documents({})
-        app_dir = await actors.count_documents({"category": "app"})
-        web_dir = await actors.count_documents({"category": "website"})
-        act_dir = tot_dir - app_dir - web_dir
-    except:
-        tot_dir = app_dir = web_dir = act_dir = 0
-
-    # ─── 📝 POST CREATION STATS (Movies / Web Series / App Video / Porn) ───
-    # post_routes.py के "category" फील्ड ("Movies", "Web Series", "App Video", "Porn")
-    # पर group-by करके गिनती निकाली जाती है, पूरा array in-memory लोड करने की बजाय
-    # MongoDB aggregation से ही count हो जाता है (हल्का और तेज़)
-    try:
-        raw_post_counts = {}
-        pipeline = [{"$group": {"_id": {"$ifNull": ["$category", "Uncategorized"]}, "count": {"$sum": 1}}}]
-        async for doc in posts_col.aggregate(pipeline):
-            raw_post_counts[doc["_id"]] = doc["count"]
-    except:
-        raw_post_counts = {}
-
-    post_movies = raw_post_counts.get("Movies", 0)
-    post_webseries = raw_post_counts.get("Web Series", 0)
-    post_appvid = raw_post_counts.get("App Video", 0)
-    post_porn = raw_post_counts.get("Porn", 0)
-    post_total = sum(raw_post_counts.values())
+    post_total, post_movies, post_webseries, post_appvid, post_porn = post_stats
     # कोई पुराना/कस्टम category value जो ऊपर के 4 fixed buckets में फिट नहीं होता
     post_other = post_total - post_movies - post_webseries - post_appvid - post_porn
 

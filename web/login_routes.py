@@ -25,7 +25,6 @@ async def api_login_user(req):
         )
 
         s = str(uuid.uuid4())
-        if not hasattr(temp, 'USER_SESSIONS'): temp.USER_SESSIONS = {}
         temp.USER_SESSIONS[s] = {'tg_id': user['tg_id'], 'expiry': time.time() + 86400 * 7}
         res = web.HTTPFound('/dashboard')
         res.set_cookie('user_session', s, max_age=86400 * 7)
@@ -49,7 +48,6 @@ async def api_register_step1(req):
         
     otp = str(random.randint(100000, 999999))
     now = time.time()
-    if not hasattr(temp, 'REG_PENDING'): temp.REG_PENDING = {}
     temp.REG_PENDING[tg_id] = {'email': email, 'password': password, 'otp': otp, 'expiry': now + 300}
     try: 
         await temp.BOT.send_message(tg_id, f"🔐 **Web Registration Verification**\n\nSomeone is trying to link your Telegram ID to this email: `{email}`\n\n**Your OTP is:** `{otp}`\n\n_Valid for 5 mins._")

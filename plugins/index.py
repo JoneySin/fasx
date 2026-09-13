@@ -14,6 +14,54 @@ from Script import script
 logger = logging.getLogger(__name__)
 lock = asyncio.Lock()
 
+# ─────────────────────────────────────────────
+# 🧩 SHARED UI BUILDERS
+# ✅ DRY: collection-picker का button-set + edit-text यहाँ दो बार हुबहू लिखा था
+# (`ident == 'yes'` और `ident == 'ask_skip'` branches में) और indexing status text
+# तीन बार (cancel / progress / complete)। एक जगह counter rename करना हो तो 3 जगह
+# edit करना पड़ता था। अब दोनों एक ही helper से बनते हैं।
+# ─────────────────────────────────────────────
+def collection_picker_markup(chat, lst_msg_id, skip):
+    """Primary / Cloud / Archive चुनने वाला inline keyboard"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton('✅ PRIMARY', callback_data=f'index#start#{chat}#{lst_msg_id}#{skip}#primary'),
+            InlineKeyboardButton('📂 CLOUD', callback_data=f'index#start#{chat}#{lst_msg_id}#{skip}#cloud')
+        ],
+        [
+            InlineKeyboardButton('📦 ARCHIVES', callback_data=f'index#start#{chat}#{lst_msg_id}#{skip}#archive')
+        ],
+        [
+            InlineKeyboardButton('❌ CANCEL', callback_data='close_data')
+        ]
+    ])
+
+async def show_collection_picker(query, chat, lst_msg_id, skip):
+    await query.message.edit(
+        "🗂️ <b>Select Collection to Index:</b>\n"
+        f"⏭️ Skip: <code>{skip}</code>\n\n"
+        "• <b>PRIMARY</b> - Main database\n"
+        "• <b>CLOUD</b> - Cloud storage\n"
+        "• <b>ARCHIVES</b> - Archive storage",
+        reply_markup=collection_picker_markup(chat, lst_msg_id, skip)
+    )
+
+def index_status_text(collection_type, time_taken, current, saved, duplicate,
+                      deleted, no_media, unsupported, errors, badfiles):
+    """Indexing progress/final report — cancel, progress और complete तीनों यही use करते हैं"""
+    return (
+        f"📚 Collection: <code>{collection_type.upper()}</code>\n"
+        f"⏱ Time: <code>{time_taken}</code>\n\n"
+        f"📨 Total Received: <code>{current}</code>\n"
+        f"📁 Saved Files: <code>{saved}</code>\n"
+        f"🔄 Duplicates: <code>{duplicate}</code>\n"
+        f"🗑 Deleted: <code>{deleted}</code>\n"
+        f"❌ No Media: <code>{no_media + unsupported}</code>\n"
+        f"⚠️ Unsupported: <code>{unsupported}</code>\n"
+        f"❗ Errors: <code>{errors}</code>\n"
+        f"🚫 Bad Files: <code>{badfiles}</code>"
+    )
+
 @Client.on_callback_query(filters.regex(r'^index'))
 async def index_files(bot, query):
     data_parts = query.data.split("#")
@@ -24,27 +72,8 @@ async def index_files(bot, query):
         lst_msg_id = data_parts[3]
         skip = data_parts[4]
         
-        buttons = [
-            [
-                InlineKeyboardButton('✅ PRIMARY', callback_data=f'index#start#{chat}#{lst_msg_id}#{skip}#primary'),
-                InlineKeyboardButton('📂 CLOUD', callback_data=f'index#start#{chat}#{lst_msg_id}#{skip}#cloud')
-            ],
-            [
-                InlineKeyboardButton('📦 ARCHIVES', callback_data=f'index#start#{chat}#{lst_msg_id}#{skip}#archive')
-            ],
-            [
-                InlineKeyboardButton('❌ CANCEL', callback_data='close_data')
-            ]
-        ]
-        await query.message.edit(
-            f"🗂️ <b>Select Collection to Index:</b>\n"
-            f"⏭️ Skip: <code>{skip}</code>\n\n"
-            "• <b>PRIMARY</b> - Main database\n"
-            "• <b>CLOUD</b> - Cloud storage\n"
-            "• <b>ARCHIVES</b> - Archive storage",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        
+        await show_collection_picker(query, chat, lst_msg_id, skip)
+
     elif ident == 'ask_skip':
         chat = data_parts[2]
         lst_msg_id = data_parts[3]
@@ -58,26 +87,8 @@ async def index_files(bot, query):
         except:
             return await query.message.edit("❌ Invalid number or Timeout. Try again.")
             
-        buttons = [
-            [
-                InlineKeyboardButton('✅ PRIMARY', callback_data=f'index#start#{chat}#{lst_msg_id}#{skip}#primary'),
-                InlineKeyboardButton('📂 CLOUD', callback_data=f'index#start#{chat}#{lst_msg_id}#{skip}#cloud')
-            ],
-            [
-                InlineKeyboardButton('📦 ARCHIVES', callback_data=f'index#start#{chat}#{lst_msg_id}#{skip}#archive')
-            ],
-            [
-                InlineKeyboardButton('❌ CANCEL', callback_data='close_data')
-            ]
-        ]
-        await query.message.edit(
-            f"🗂️ <b>Select Collection to Index:</b>\n"
-            f"⏭️ Skip: <code>{skip}</code>\n\n"
-            "• <b>PRIMARY</b> - Main database\n"
-            "• <b>CLOUD</b> - Cloud storage\n"
-            "• <b>ARCHIVES</b> - Archive storage",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        await show_collection_picker(query, chat, lst_msg_id, skip)
+
     
     elif ident == 'start':
         chat = data_parts[2]
@@ -180,26 +191,18 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot, skip, collection_type="p
                 
                 if temp.CANCEL:
                     temp.CANCEL = False
-                    status_cap = (
-                        f"<b>✅ Successfully Cancelled!</b>\n"
-                        f"📚 Collection: <code>{collection_type.upper()}</code>\n"
-                        f"⏱ Completed in: <code>{time_taken}</code>\n\n"
-                        f"📁 Saved Files: <code>{total_files}</code>\n"
-                        f"🔄 Duplicates: <code>{duplicate}</code>\n"
-                        f"🗑 Deleted: <code>{deleted}</code>\n"
-                        f"❌ No Media: <code>{no_media + unsupported}</code>\n"
-                        f"⚠️ Unsupported: <code>{unsupported}</code>\n"
-                        f"❗ Errors: <code>{errors}</code>\n"
-                        f"🚫 Bad Files: <code>{badfiles}</code>"
+                    await msg.edit(
+                        "<b>✅ Successfully Cancelled!</b>\n"
+                        + index_status_text(collection_type, time_taken, current, total_files,
+                                            duplicate, deleted, no_media, unsupported, errors, badfiles)
                     )
-                    await msg.edit(status_cap)
                     
                     # ✅ FIX: कैंसिल होने पर भी LOG_CHANNEL में पूरी रिपोर्ट पुश करें
                     if LOG_CHANNEL:
                         try:
                             await bot.send_message(
                                 LOG_CHANNEL,
-                                script.LOG_INDEX_TXT.format(chat_title, chat_id_str, collection_type.upper(), current, total_files, duplicate, unsupported, errors) + f"\n\n⚠️ <b>Status:</b> <code>Cancelled by Admin 🛑</code>"
+                                script.LOG_INDEX_TXT.format(chat_title, chat_id_str, collection_type.upper(), current, total_files, duplicate, unsupported, errors) + "\n\n⚠️ <b>Status:</b> <code>Cancelled by Admin 🛑</code>"
                             )
                         except: pass
                     return
@@ -214,17 +217,9 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot, skip, collection_type="p
                     ]]
                     try:
                         await msg.edit_text(
-                            text=f"<b>📊 Indexing Progress</b>\n"
-                            f"📚 Collection: <code>{collection_type.upper()}</code>\n"
-                            f"⏱ Time: <code>{time_taken}</code>\n\n"
-                            f"📨 Total Received: <code>{current}</code>\n"
-                            f"📁 Saved: <code>{total_files}</code>\n"
-                            f"🔄 Duplicates: <code>{duplicate}</code>\n"
-                            f"🗑 Deleted: <code>{deleted}</code>\n"
-                            f"❌ No Media: <code>{no_media + unsupported}</code>\n"
-                            f"⚠️ Unsupported: <code>{unsupported}</code>\n"
-                            f"❗ Errors: <code>{errors}</code>\n"
-                            f"🚫 Bad Files: <code>{badfiles}</code>", 
+                            text="<b>📊 Indexing Progress</b>\n"
+                                 + index_status_text(collection_type, time_taken, current, total_files,
+                                                     duplicate, deleted, no_media, unsupported, errors, badfiles),
                             reply_markup=InlineKeyboardMarkup(btn)
                         )
                     except FloodWait as e:
@@ -277,16 +272,9 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot, skip, collection_type="p
         else:
             time_taken = get_readable_time(time.time() - start_time)
             await msg.edit(
-                f'<b>✅ Successfully Indexed!</b>\n'
-                f'📚 Collection: <code>{collection_type.upper()}</code>\n'
-                f'⏱ Completed in: <code>{time_taken}</code>\n\n'
-                f'📁 Saved Files: <code>{total_files}</code>\n'
-                f'🔄 Duplicates: <code>{duplicate}</code>\n'
-                f'🗑 Deleted: <code>{deleted}</code>\n'
-                f'❌ No Media: <code>{no_media + unsupported}</code>\n'
-                f'⚠️ Unsupported: <code>{unsupported}</code>\n'
-                f'❗ Errors: <code>{errors}</code>\n'
-                f'🚫 Bad Files: <code>{badfiles}</code>'
+                "<b>✅ Successfully Indexed!</b>\n"
+                + index_status_text(collection_type, time_taken, current, total_files,
+                                    duplicate, deleted, no_media, unsupported, errors, badfiles)
             )
             
             # 📢 ✅ FIX: इंडेक्सिंग सफलतापूर्वक ख़त्म होते ही LOG_CHANNEL में सुपर रिपोर्ट भेजें
