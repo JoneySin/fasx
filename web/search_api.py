@@ -13,7 +13,7 @@ from lru import LRU
 from aiohttp import web
 
 # कस्टमाइज्ड कोर यूटिल्स और कन्फर्म कंट्रोल्स इम्पोर्ट्स
-from utils import temp, get_size, is_premium
+from utils import temp, get_size, is_premium, get_duration_str
 # ✅ SYNC: THUMBNAIL_STORAGE_CHANNEL को इम्पोर्ट किया गया है पृथक स्टोरेज के लिए
 from info import BIN_CHANNEL, ADMINS, BOT_TOKEN, MAX_WEB_RESULTS, MAX_THUMB_CACHE, IS_PREMIUM, THUMBNAIL_STORAGE_CHANNEL
 # यहाँ db_stats के लिए 'db as filter_db' ऐड किया गया है
@@ -73,7 +73,7 @@ async def _get_or_fetch_thumb(fid, col_name="primary", is_retry=False):
 
             async def _fetch():
                 target_collection = COLLECTIONS.get(col_name, COLLECTIONS["primary"])
-                existing = await target_collection.find_one({"_id": fid}, {"thumb_url": 1})
+                existing = await target_collection.find_one({"_id": fid}, {"thumb_url": 1, "duration": 1})
 
                 if existing and existing.get("thumb_url", "").startswith("TG_ID:"):
                     saved_thumb_id = existing["thumb_url"].replace("TG_ID:", "")
@@ -90,6 +90,12 @@ async def _get_or_fetch_thumb(fid, col_name="primary", is_retry=False):
                     try:
                         msg = await temp.BOT.send_cached_media(chat_id=BIN_CHANNEL, file_id=fid)
                         thumb_id = None
+
+                        # ✅ NEW: purane (duration ke bina index huye) docs ke liye free
+                        # backfill — yeh msg hum thumbnail ke liye waise hi bhejte hain,
+                        # isliye extra Telegram API call ya DB read nahi lagti. Sirf tab
+                        # likhte hain jab doc me duration abhi maujood na ho.
+                        await _backfill_duration(target_collection, fid, existing, msg)
 
                         if msg.video and msg.video.thumbs and len(msg.video.thumbs) > 0:
                             thumb_id = msg.video.thumbs[0].file_id
@@ -129,6 +135,26 @@ async def _get_or_fetch_thumb(fid, col_name="primary", is_retry=False):
 
     finally:
         thumb_locks.pop(cache_key, None)
+
+
+# ─────────────────────────────────────────────────────────
+# ⏱️ DURATION LAZY BACKFILL (purani files ke liye, bina extra API call)
+# ─────────────────────────────────────────────────────────
+async def _backfill_duration(col, fid, existing, msg):
+    """Thumbnail msg se video duration nikalkar DB me save karta hai (sirf agar missing ho).
+
+    Fail hone par thumbnail flow ko bilkul nahi rokta — duration sirf ek cosmetic
+    web-UI field hai, iske liye poster serve karna band nahi hona chahiye.
+    """
+    try:
+        if existing and existing.get("duration"):
+            return  # pehle se maujood hai, dobara likhne ki zaroorat nahi
+        media = getattr(msg, msg.media.value, None) if getattr(msg, "media", None) else None
+        duration = int(getattr(media, "duration", 0) or 0)
+        if duration > 0:
+            await col.update_one({"_id": fid}, {"$set": {"duration": duration}})
+    except Exception as e:
+        logger.debug(f"Duration backfill skipped for {fid}: {e}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -242,6 +268,9 @@ def _build_results_list(all_m, mode):
             "file_id": db_id,
             "name": d.get("file_name", "Unknown File"),
             "size": get_size(d.get("file_size", 0)),
+            # ✅ NEW: video duration (e.g. "1:02:03"). Purani/unindexed files me duration
+            # 0 hota hai, tab khali string jaati hai aur UI me chip ban hi nahi.
+            "duration": get_duration_str(d.get("duration")),
             "type": d.get("file_type", "document").upper(),
             "source": source_collection_name.capitalize(),
             "raw_collection": source_collection_name,

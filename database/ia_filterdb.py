@@ -183,7 +183,19 @@ async def save_file(media, collection_type="primary"):
         if existing_doc:
             return "dup"
 
-        update_set = {"file_ref":  media.file_id, "file_name": f_name, "file_size": media.file_size, "file_type": file_type}
+        # ✅ NEW: video/audio ki duration (seconds) bhi save karte hain — sirf web UI
+        # me dikhane ke liye (Telegram bot ke messages me jaan-boojhkar nahi bhejte).
+        # hydrogram me Video/Animation/Audio par .duration hota hai, Document par nahi,
+        # isliye getattr se safe rakha hai (documents ke liye 0 → UI me chip hide).
+        duration = int(getattr(media, "duration", 0) or 0)
+
+        update_set = {
+            "file_ref":  media.file_id,
+            "file_name": f_name,
+            "file_size": media.file_size,
+            "file_type": file_type,
+            "duration":  duration,
+        }
 
         update_payload = {"$set": update_set, "$setOnInsert": {"added_on": time.time()}}
         unset_payload = {}
@@ -220,7 +232,7 @@ def _build_regex(query: str):
 # 📑 SHARED PROJECTION (पहले यह 7 जगह हुबहू टाइप किया गया था)
 # ─────────────────────────────────────────────────────────
 FILE_PROJECTION = {"_id": 1, "file_name": 1, "file_size": 1, "file_type": 1,
-                   "file_ref": 1, "caption": 1, "thumb_url": 1}
+                   "file_ref": 1, "caption": 1, "thumb_url": 1, "duration": 1}
 FILE_PROJECTION_SCORED = {**FILE_PROJECTION, "score": {"$meta": "textScore"}}
 
 # ─────────────────────────────────────────────────────────

@@ -191,6 +191,12 @@ async function doSearch(o,allowEmpty){
                 '</div>';
             }
 
+            /* ⏱️ Duration chip — sirf tab jab API ne asli duration bheja ho.
+               Purani (bina-duration index huyi) files par f.duration khali aata hai,
+               tab chip banta hi nahi — "0:00" jaisa bekaar text nahi dikhta. */
+            var durChip  = f.duration ? '<span class="dur-chip">'+f.duration+'</span>' : '';
+            var durText  = f.duration ? '<span class="tc-dur">'+f.duration+'</span>' : '';
+
             var posterHtml='';
             if(pMode!=='none'){
                 posterHtml='<div class="poster-box" id="poster-box-'+f.file_id+'" onclick="toggleAdminBtns(this.closest(\\'.file-card\\'),event)">'+
@@ -198,6 +204,7 @@ async function doSearch(o,allowEmpty){
                     '<div class="poster-top">'+
                         '<span class="type-chip">'+f.type.toUpperCase()+'</span>'+
                         '<span class="size-chip">'+f.size+'</span>'+
+                        durChip+
                         '<span class="source-pill '+sc+'"><span class="source-dot"></span>'+sc.toUpperCase()+'</span>'+
                     '</div>'+
                     adminBtns+
@@ -209,6 +216,7 @@ async function doSearch(o,allowEmpty){
                 textInfo='<div class="fc-text-info" onclick="toggleAdminBtns(this.closest(\\'.file-card\\'),event)">'+
                     '<span class="tc-type">'+f.type.toUpperCase()+'</span>'+
                     '<span class="tc-size">'+f.size+'</span>'+
+                    durText+
                     '<span class="source-pill '+sc+'" style="margin-left:auto"><span class="source-dot"></span>'+sc.toUpperCase()+'</span>'+
                 '</div>';
                 if(d.is_admin){

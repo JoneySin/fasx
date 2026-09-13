@@ -629,5 +629,239 @@ class TestHealthEndpoint(unittest.TestCase):
         self.assertEqual(data["uptime_seconds"], 42.5)
 
 
+class TestDurationFormatting(unittest.TestCase):
+    """Video duration -> media-player style string (sirf web UI ke liye)."""
+
+    def test_missing_and_zero_give_empty(self):
+        from utils import get_duration_str
+        for bad in (None, 0, "", "abc", -5, []):
+            with self.subTest(bad=bad):
+                self.assertEqual(get_duration_str(bad), "")
+
+    def test_seconds_only(self):
+        from utils import get_duration_str
+        self.assertEqual(get_duration_str(1), "0:01")
+        self.assertEqual(get_duration_str(9), "0:09")
+        self.assertEqual(get_duration_str(59), "0:59")
+
+    def test_minutes_padded_seconds(self):
+        from utils import get_duration_str
+        self.assertEqual(get_duration_str(60), "1:00")
+        self.assertEqual(get_duration_str(754), "12:34")
+        self.assertEqual(get_duration_str(3599), "59:59")
+
+    def test_hours_format(self):
+        from utils import get_duration_str
+        self.assertEqual(get_duration_str(3600), "1:00:00")
+        self.assertEqual(get_duration_str(3723), "1:02:03")
+        self.assertEqual(get_duration_str(2 * 3600 + 5 * 60 + 7), "2:05:07")
+        # 10 ghante se zyada par bhi sahi
+        self.assertEqual(get_duration_str(12 * 3600 + 34 * 60 + 56), "12:34:56")
+
+    def test_accepts_string_and_float(self):
+        from utils import get_duration_str
+        self.assertEqual(get_duration_str("3723"), "1:02:03")
+        self.assertEqual(get_duration_str(3723.9), "1:02:03")
+
+    def test_differs_from_readable_time(self):
+        """get_readable_time (uptime) aur get_duration_str (video) alag formats hain."""
+        from utils import get_readable_time, get_duration_str
+        self.assertEqual(get_readable_time(3723), "1h 2m 3s")
+        self.assertEqual(get_duration_str(3723), "1:02:03")
+
+
+class TestDurationInApiResponse(unittest.TestCase):
+    """Web search API ke JSON me duration field aana chahiye (bot messages me nahi)."""
+
+    def test_duration_exposed_in_results(self):
+        from web.search_api import _build_results_list
+        docs = [{"_id": "F1", "file_ref": "R1", "file_name": "Movie 2020",
+                 "file_size": 1048576, "file_type": "video", "duration": 7260,
+                 "source_col": "primary", "thumb_url": ""}]
+        out = _build_results_list(docs, "tg")[0]
+        self.assertEqual(out["duration"], "2:01:00")
+
+    def test_missing_duration_gives_empty_not_zero(self):
+        from web.search_api import _build_results_list
+        # purani files me duration field hi nahi hai
+        docs = [{"_id": "F2", "file_ref": "R2", "file_name": "Old Movie",
+                 "file_size": 100, "file_type": "video", "source_col": "cloud",
+                 "thumb_url": ""}]
+        out = _build_results_list(docs, "tg")[0]
+        self.assertEqual(out["duration"], "")
+
+    def test_document_without_duration_is_empty(self):
+        from web.search_api import _build_results_list
+        docs = [{"_id": "F3", "file_ref": "R3", "file_name": "book.pdf",
+                 "file_size": 100, "file_type": "document", "duration": 0,
+                 "source_col": "primary", "thumb_url": ""}]
+        self.assertEqual(_build_results_list(docs, "tg")[0]["duration"], "")
+
+    def test_text_mode_also_has_duration(self):
+        from web.search_api import _build_results_list
+        docs = [{"_id": "F4", "file_ref": "R4", "file_name": "Ep 01",
+                 "file_size": 100, "file_type": "video", "duration": 1500,
+                 "source_col": "archive", "thumb_url": ""}]
+        self.assertEqual(_build_results_list(docs, "none")[0]["duration"], "25:00")
+
+
+class TestDurationStorage(unittest.TestCase):
+    """Indexing ke waqt duration DB me save hona chahiye."""
+
+    def test_save_file_persists_duration(self):
+        import asyncio
+        from unittest import mock
+        import database.ia_filterdb as fdb
+
+        class FakeMedia:
+            file_id = "CQADtest"
+            file_name = "Movie_2020.mp4"
+            caption = None
+            file_size = 12345
+            duration = 7260
+
+        captured = {}
+
+        class FakeCol:
+            async def find_one(self, *a, **k): return None
+            async def update_one(self, flt, payload, **k):
+                captured.update(payload)
+
+        with mock.patch.object(fdb, "unpack_new_file_id", return_value="ABC123"), \
+             mock.patch.object(fdb, "COLLECTIONS", {"primary": FakeCol()}):
+            # FakeMedia ka class-name lowercase 'fakemedia' banta hai — file_type ke liye theek
+            result = asyncio.run(fdb.save_file(FakeMedia(), "primary"))
+
+        self.assertEqual(result, "suc")
+        self.assertEqual(captured["$set"]["duration"], 7260)
+        self.assertEqual(captured["$set"]["file_size"], 12345)
+
+    def test_save_file_without_duration_attr_is_zero(self):
+        """Document par .duration hota hi nahi — crash nahi hona chahiye."""
+        import asyncio
+        from unittest import mock
+        import database.ia_filterdb as fdb
+
+        class FakeDoc:
+            file_id = "CQADtest"
+            file_name = "book.pdf"
+            caption = None
+            file_size = 999
+
+        captured = {}
+
+        class FakeCol:
+            async def find_one(self, *a, **k): return None
+            async def update_one(self, flt, payload, **k):
+                captured.update(payload)
+
+        with mock.patch.object(fdb, "unpack_new_file_id", return_value="ABC999"), \
+             mock.patch.object(fdb, "COLLECTIONS", {"primary": FakeCol()}):
+            result = asyncio.run(fdb.save_file(FakeDoc(), "primary"))
+
+        self.assertEqual(result, "suc")
+        self.assertEqual(captured["$set"]["duration"], 0)
+
+    def test_projection_includes_duration(self):
+        from database.ia_filterdb import FILE_PROJECTION, FILE_PROJECTION_SCORED
+        self.assertEqual(FILE_PROJECTION.get("duration"), 1)
+        self.assertEqual(FILE_PROJECTION_SCORED.get("duration"), 1)
+
+
+class TestDurationBackfill(unittest.TestCase):
+    """Purani files: thumbnail fetch ke waqt duration free me backfill hota hai."""
+
+    def _run(self, existing, duration_on_msg):
+        import asyncio
+        from unittest import mock
+        from web.search_api import _backfill_duration
+
+        writes = []
+
+        class FakeCol:
+            async def update_one(self, flt, payload, **k): writes.append(payload)
+
+        class FakeMedia: duration = duration_on_msg
+
+        msg = mock.MagicMock()
+        msg.media = mock.MagicMock()
+        msg.media.value = "video"
+        msg.video = FakeMedia()
+
+        asyncio.run(_backfill_duration(FakeCol(), "FID", existing, msg))
+        return writes
+
+    def test_backfills_when_missing(self):
+        writes = self._run({"_id": "FID", "duration": 0}, 3600)
+        self.assertEqual(writes, [{"$set": {"duration": 3600}}])
+
+    def test_skips_when_already_present(self):
+        writes = self._run({"_id": "FID", "duration": 3600}, 9999)
+        self.assertEqual(writes, [], "already-present duration par dobara write nahi hona chahiye")
+
+    def test_skips_when_msg_has_no_duration(self):
+        writes = self._run({"_id": "FID", "duration": 0}, 0)
+        self.assertEqual(writes, [])
+
+    def test_never_raises(self):
+        """Thumbnail flow ko duration ki wajah se kabhi fail nahi hona chahiye."""
+        import asyncio
+        from web.search_api import _backfill_duration
+
+        class BoomCol:
+            async def update_one(self, *a, **k): raise RuntimeError("db down")
+
+        asyncio.run(_backfill_duration(BoomCol(), "FID", {}, None))  # raise nahi karna chahiye
+
+
+class TestDurationOnlyOnWeb(unittest.TestCase):
+    """User ne kaha 'sirf web per' — Telegram bot ke messages me duration nahi jaana chahiye."""
+
+    def test_bot_filter_caption_has_no_duration(self):
+        import inspect
+        import plugins.filter as flt
+        src = inspect.getsource(flt.get_filter_ui)
+        self.assertNotIn("duration", src,
+                         "bot ke result message me duration nahi jaana chahiye (sirf web)")
+
+    def test_bot_search_script_has_no_duration(self):
+        from Script import script
+        for name in ("NOT_FILE_TXT", "FILE_CAPTION"):
+            self.assertNotIn("duration", getattr(script, name).lower())
+
+
+class TestDurationInWebUI(unittest.TestCase):
+    """Render huye HTML/JS me duration chip actually maujood ho."""
+
+    def test_dashboard_renders_duration_chip(self):
+        from web.dashboard_routes import JS_ENGINE
+        self.assertIn("dur-chip", JS_ENGINE)
+        self.assertIn("tc-dur", JS_ENGINE)
+        self.assertIn("f.duration", JS_ENGINE)
+
+    def test_dashboard_css_defines_chips(self):
+        from web.web_assets import CSS
+        self.assertIn(".dur-chip{", CSS)
+        self.assertIn(".tc-dur{", CSS)
+
+    def test_miniapp_renders_duration_chip(self):
+        import os
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "web", "miniapp.html")
+        with open(path, encoding="utf-8") as fh:
+            html = fh.read()
+        self.assertIn('class="dc"', html)
+        self.assertIn('class="td"', html)
+        self.assertIn("f.duration", html)
+        self.assertIn(".dc{", html)
+
+    def test_actor_page_renders_duration_chip(self):
+        import inspect
+        import web.actor_routes as ar
+        src = inspect.getsource(ar.actor_profile_display)
+        self.assertIn("dur-chip", src)
+        self.assertIn("tc-dur", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

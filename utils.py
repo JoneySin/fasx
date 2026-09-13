@@ -171,6 +171,28 @@ def get_readable_time(seconds):
             res += f"{int(val)}{name} "
     return res.strip() or "0s"
 
+def get_duration_str(seconds):
+    """Video/audio duration ko media-player style string me badalta hai.
+
+    get_readable_time() se jaan-boojhkar alag hai: wo "1h 2m 3s" deta hai (uptime ke
+    liye), jabki video cards par duniya bhar me "1:02:03" chalta hai.
+    - duration na ho / 0 ho to "" (khali) — UI me chip hi nahi banega, "0:00" jaisa
+      bekaar text nahi dikhega.
+    - 1 ghante se chhota:  "M:SS"      (e.g. 12:34)
+    - 1 ghante ya zyada:   "H:MM:SS"   (e.g. 1:02:03)
+    """
+    try:
+        total = int(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if total <= 0:
+        return ""
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
 def get_wish():
     # ✅ FIX: कचरा टेक्स्ट और अशुद्धियों को हटाकर कस्टमाइज्ड टाइमज़ोन विश इंजन सिंक किया गया
     tz = pytz.timezone(TIME_ZONE)
