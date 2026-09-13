@@ -863,5 +863,94 @@ class TestDurationInWebUI(unittest.TestCase):
         self.assertIn("tc-dur", src)
 
 
+# ─────────────────────────────────────────────
+# 🧭 COMMAND LIST ↔ HANDLER SYNC
+# ─────────────────────────────────────────────
+def _walk_command_filters(f, depth=0, seen=None):
+    """Hydrogram filter tree ko todo, CommandFilter.commands nikaalo.
+
+    AndFilter/OrFilter child ko `.base` / `.other` me rakhte hain
+    (pyrogram jaisa `.f1`/`.f2` NAHI), isliye recursive walk zaroori hai.
+    """
+    seen = set() if seen is None else seen
+    if f is None or depth > 12 or id(f) in seen:
+        return []
+    seen.add(id(f))
+    if type(f).__name__ == "CommandFilter":
+        return list(f.commands)
+    out = []
+    for name in (vars(f) if hasattr(f, "__dict__") else []):
+        try:
+            v = getattr(f, name)
+        except Exception:
+            continue
+        if isinstance(v, list):
+            for it in v:
+                out += _walk_command_filters(it, depth + 1, seen)
+        elif v.__class__.__module__.startswith(("hydrogram", "pyrogram")):
+            out += _walk_command_filters(v, depth + 1, seen)
+    return out
+
+
+def _live_bot_commands():
+    """Har plugin import karke actually-registered commands ka set."""
+    import importlib
+    import pkgutil
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    live = set()
+    for mod in sorted(pkgutil.iter_modules([os.path.join(root, "plugins")])):
+        m = importlib.import_module("plugins." + mod.name)
+        for _name, obj in vars(m).items():
+            for handler, _grp in (getattr(obj, "handlers", None) or []):
+                live.update(_walk_command_filters(handler.filters))
+    return live
+
+
+def _listed_commands():
+    """Script.py ke help panels me jo commands likhe hain."""
+    import re
+    import Script
+
+    listed = set()
+    for block in ("USER_COMMAND_TXT", "ADMIN_COMMAND_TXT"):
+        txt = getattr(Script.script, block, "")
+        txt = re.sub(r"</?[a-z]+>", "", txt)   # HTML tags command nahi hain
+        listed.update(re.findall(r"/([a-z_]+)", txt))
+    return listed
+
+
+class TestCommandListMatchesHandlers(unittest.TestCase):
+    """Help panel ka command list jhoot na bole — dono taraf exact match."""
+
+    def test_no_dead_commands_in_list(self):
+        dead = sorted(_listed_commands() - _live_bot_commands())
+        self.assertEqual(
+            dead, [],
+            "Ye commands help panel me listed hain par inka koi handler nahi: "
+            + ", ".join("/" + c for c in dead),
+        )
+
+    def test_no_undocumented_live_commands(self):
+        undoc = sorted(_live_bot_commands() - _listed_commands())
+        self.assertEqual(
+            undoc, [],
+            "Ye commands live hain par help panel me listed nahi: "
+            + ", ".join("/" + c for c in undoc),
+        )
+
+    def test_list_is_not_empty(self):
+        # Sanity: agar parser toot jaye to dono set khali ho jaate aur
+        # upar wale dono tests "pass" ho jaate. Isse wo pakda jayega.
+        self.assertGreaterEqual(len(_listed_commands()), 25)
+        self.assertGreaterEqual(len(_live_bot_commands()), 25)
+
+    def test_removed_dead_commands_stay_removed(self):
+        listed = _listed_commands()
+        for gone in ("fileid", "ask", "ai", "mute", "unmute", "ban", "warn",
+                     "resetwarn", "addblacklist", "removeblacklist",
+                     "blacklist", "dlink", "removedlink", "dlinklist"):
+            self.assertNotIn(gone, listed, f"/{gone} wapas list me aa gaya")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
