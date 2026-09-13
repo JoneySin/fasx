@@ -14,7 +14,12 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 @routes.get("/", allow_head=True)
 async def root_route_handler(request):
-    bot_username = getattr(temp, 'U_NAME', 'AutoFilterBot')
+    # ✅ BUG FIX: pehle `getattr(temp, 'U_NAME', 'AutoFilterBot')` tha, par temp.U_NAME
+    # class me already `None` declared hai — isliye getattr ka default KABHI apply nahi
+    # hota tha aur bot_username `None` aata tha. Uske baad `.replace(..., None)`
+    # TypeError deta tha, yaani homepage `/` pura 500 crash karta tha jab tak bot client
+    # start na ho jaaye. Ab `or` se sahi fallback milta hai.
+    bot_username = temp.U_NAME or 'AutoFilterBot'
 
     html_content = """<!DOCTYPE html>
 <html lang="en">
@@ -121,6 +126,34 @@ async def watch_handler(request):
 
 
 # ─────────────────────────────────────────────
+# 📐 HTTP RANGE PARSER (extracted + hardened)
+# ✅ BUG FIX: पहले यह parsing media_download() के अंदर inline थी और `r_head` try-block
+# के अंदर assign होकर बाहर इस्तेमाल होता था — अगर `int()` कहीं बीच में फेंकता तो
+# `r_head` unbound रह सकता था। साथ ही unsatisfiable range (start > file_size) पर
+# 416 की जगह आगे बढ़कर negative Content-Length बन सकता था। अब सब एक pure function
+# में है, इसलिए इसे test भी किया जा सकता है।
+# return: (first_byte, last_byte, length, is_partial) या None (416 भेजना है)
+# ─────────────────────────────────────────────
+def parse_range(header, file_size):
+    """Range header को validated (start, end, length, partial) में बदलता है।"""
+    partial = bool(header)
+    try:
+        if header:
+            parts = header.replace("bytes=", "").split("-")
+            first = int(parts[0]) if parts[0] else 0
+            last = int(parts[1]) if parts[1] else file_size - 1
+        else:
+            first, last = 0, file_size - 1
+    except Exception:
+        first, last, partial = 0, file_size - 1, False
+
+    last = min(last, file_size - 1)          # upper bound clamp
+    if first < 0 or last < first:            # unsatisfiable
+        return None
+    return first, last, last - first + 1, partial
+
+
+# ─────────────────────────────────────────────
 # 📥 DOWNLOAD & STREAMING CORE
 # ─────────────────────────────────────────────
 @routes.get("/download/{message_id}")
@@ -156,28 +189,15 @@ async def media_download(request, message_id: int):
             or "application/octet-stream"
         )
 
-        # ── Range Header Parse ──
-        try:
-            r_head = request.headers.get('Range')
-            if r_head:
-                parts_str = r_head.replace('bytes=', '').split('-')
-                fb = int(parts_str[0]) if parts_str[0] else 0
-                ub = int(parts_str[1]) if parts_str[1] else file_size - 1
-            else:
-                fb, ub = 0, file_size - 1
-        except Exception:
-            fb, ub = 0, file_size - 1
-
-        # ── Clamp / Validate ──
-        ub = min(ub, file_size - 1)
-        if fb < 0 or ub < fb:
+        # ── Range Header Parse + Clamp/Validate (देखें parse_range) ──
+        parsed = parse_range(request.headers.get('Range'), file_size)
+        if parsed is None:
             return web.Response(
                 status=416,
                 body="416: Range Not Satisfiable",
                 headers={"Content-Range": f"bytes */{file_size}"}
             )
-
-        req_len = ub - fb + 1
+        fb, ub, req_len, is_partial = parsed
 
         # ✅ FIX: chunk_size और offset_fix अब plain def हैं — await हटाया
         ncs    = chunk_size(req_len)
@@ -197,7 +217,7 @@ async def media_download(request, message_id: int):
         enc_fn = quote(file_name)
 
         return web.Response(
-            status=206 if r_head else 200,
+            status=206 if is_partial else 200,
             body=body,
             headers={
                 "Content-Type":        mime_type,

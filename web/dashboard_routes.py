@@ -1,3 +1,4 @@
+import time
 from aiohttp import web
 from web.web_assets import build_page, get_auth, form_wrapper, MAX_WEB_RESULTS, require_active_plan
 from utils import temp
@@ -127,21 +128,12 @@ document.querySelectorAll('.cdd-menu').forEach(function(m){
 });
 function changeCol(val){curCol=val;if(curQ)doSearch(0);}
 
-function handleThumbError(fileId) {
-    var img = document.getElementById('img-poster-' + fileId);
-    if (img) { img.style.opacity = '0'; }
-    var errBox = document.getElementById('thumb-err-' + fileId);
-    if (!errBox) {
-        var box = document.getElementById('poster-box-' + fileId);
-        if (box) {
-            var div = document.createElement('div');
-            div.id = 'thumb-err-' + fileId;
-            div.className = 'thumb-error';
-            div.innerHTML = '<span style="font-size:11px;color:var(--muted);">थंबनेल लोड नहीं हुआ</span>';
-            box.appendChild(div);
-        }
-    }
-}
+/* ✅ DUPLICATE REMOVED: handleThumbError() यहाँ दोबारा defined था, जबकि
+   web_assets.py के global JS में यह पहले से है (और वहाँ वाला version बेहतर है —
+   पूरा poster-box overlay करता है, सिर्फ़ छोटा span नहीं)। build_page() global JS
+   <head> में डालता है और यह script <body> में बाद में आता है, इसलिए यही कमज़ोर
+   copy global वाली को shadow कर रही थी — यानी dashboard पर thumbnail-fail हमेशा
+   घटिया दिखता था। अब सिर्फ़ global version चलता है। */
 
 function triggerRipple(btn){btn.classList.remove('ripple-go');void btn.offsetWidth;btn.classList.add('ripple-go');setTimeout(function(){btn.classList.remove('ripple-go');},460);}
 
@@ -199,6 +191,12 @@ async function doSearch(o,allowEmpty){
                 '</div>';
             }
 
+            /* ⏱️ Duration chip — sirf tab jab API ne asli duration bheja ho.
+               Purani (bina-duration index huyi) files par f.duration khali aata hai,
+               tab chip banta hi nahi — "0:00" jaisa bekaar text nahi dikhta. */
+            var durChip  = f.duration ? '<span class="dur-chip">'+f.duration+'</span>' : '';
+            var durText  = f.duration ? '<span class="tc-dur">'+f.duration+'</span>' : '';
+
             var posterHtml='';
             if(pMode!=='none'){
                 posterHtml='<div class="poster-box" id="poster-box-'+f.file_id+'" onclick="toggleAdminBtns(this.closest(\\'.file-card\\'),event)">'+
@@ -206,6 +204,7 @@ async function doSearch(o,allowEmpty){
                     '<div class="poster-top">'+
                         '<span class="type-chip">'+f.type.toUpperCase()+'</span>'+
                         '<span class="size-chip">'+f.size+'</span>'+
+                        durChip+
                         '<span class="source-pill '+sc+'"><span class="source-dot"></span>'+sc.toUpperCase()+'</span>'+
                     '</div>'+
                     adminBtns+
@@ -217,6 +216,7 @@ async function doSearch(o,allowEmpty){
                 textInfo='<div class="fc-text-info" onclick="toggleAdminBtns(this.closest(\\'.file-card\\'),event)">'+
                     '<span class="tc-type">'+f.type.toUpperCase()+'</span>'+
                     '<span class="tc-size">'+f.size+'</span>'+
+                    durText+
                     '<span class="source-pill '+sc+'" style="margin-left:auto"><span class="source-dot"></span>'+sc.toUpperCase()+'</span>'+
                 '</div>';
                 if(d.is_admin){
@@ -356,8 +356,7 @@ async def dash(req):
 @dashboard_routes.get('/logout')
 async def logout(req):
     s_user = req.cookies.get('user_session')
-    if s_user and hasattr(temp, 'USER_SESSIONS') and s_user in temp.USER_SESSIONS:
-        del temp.USER_SESSIONS[s_user]
+    temp.USER_SESSIONS.pop(s_user, None)
     res = web.HTTPFound('/login')
     res.del_cookie('user_session')
     return res
@@ -387,6 +386,14 @@ async def premium_expired(req):
 
 
 # ✅ OPTIMIZATION 2: Koyeb Health Check Route
+# ✅ DEDUPE: /health पहले यहाँ और bot.py — दोनों में रजिस्टर था। web/__init__.py
+# पहले चलने की वजह से यही वाला match होता था, bot.py वाला कभी execute नहीं होता था
+# (dead code)। अब route एक ही है, और bot.py वाले handler का useful हिस्सा (uptime)
+# यहाँ merge कर दिया गया है।
 @dashboard_routes.get('/health')
 async def koyeb_health_check(req):
-    return web.json_response({"status": "alive", "platform": "koyeb"})
+    return web.json_response({
+        "status": "alive",
+        "platform": "koyeb",
+        "uptime_seconds": round(time.time() - temp.START_TIME, 2),
+    })

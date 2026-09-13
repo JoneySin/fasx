@@ -1,4 +1,3 @@
-import os
 import io
 import qrcode
 import asyncio
@@ -21,15 +20,15 @@ except RuntimeError:
     asyncio.set_event_loop(loop)
 
 # Ab pyromod bina kisi thread crash ke safely load hoga
-import pyromod.listen 
-from hydrogram import Client, filters, enums
+import pyromod.listen  # noqa: F401  (side-effect import: Client.listen() isi se aata hai)
+from hydrogram import Client, filters
 from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 # डेटाबेस इम्पोर्ट्स
 from database.users_chats_db import db, web_db 
 from info import (
-    IS_PREMIUM, PRE_DAY_AMOUNT, RECEIPT_SEND_USERNAME, 
-    UPI_ID, UPI_NAME, ADMINS, LOG_CHANNEL, TIME_ZONE,
+    IS_PREMIUM, PRE_DAY_AMOUNT, RECEIPT_SEND_USERNAME,
+    UPI_ID, UPI_NAME, ADMINS, LOG_CHANNEL,
     PREMIUM_REMINDER_BUSY_GAP
 )
 from Script import script
@@ -39,7 +38,11 @@ from Script import script
 # Is file ka apna 'is_premium(uid, bot)' poori tarah hataya gaya - wo kahin
 # bhi call nahi hota tha (dead code), baki sab jagah utils.is_premium hi
 # use hota hai.
-from utils import temp, get_readable_time, get_wish, get_local_now, parse_expire_time, safe_del
+# ✅ DRY: RESET_PLAN_STATUS bhi ab utils/database se aata hai - pehle yahan 11-key
+# wala reset dict 3 baar (check_premium_expired, manage_premium, pay_action) copy tha.
+from utils import (
+    get_local_now, parse_expire_time, safe_del, RESET_PLAN_STATUS
+)
 
 logger = logging.getLogger(__name__)
 VERIFY_CACHE = {}
@@ -50,11 +53,12 @@ ADMIN_ALERT = "👑 You are the Admin! You have Lifetime Premium access."
 # =========================================
 # Is file ke liye bacha hua akela lifecycle helper
 # =========================================
-# NOTE: yeh jaan-boojhkar utils.get_ist_str se alag rakha gaya hai. Premium
-# plan ka 'expire' get_local_now() (naive, pehle se local time) se banta hai,
-# isliye ise seedha format karna hai - utils.get_ist_str apne dt mein +5:30
-# jodta hai, jo yahan lagane par time galat (double-shifted) dikha dega.
-def get_ist_str(dt):
+# NOTE: naam badla (pehle get_ist_str tha) - utils.py mein usi naam ka ek dead
+# function tha jo dt mein +5:30 jodta tha, aur dono ka kaam alag tha, isliye
+# confusion hota tha. Premium plan ka 'expire' get_local_now() (naive, pehle se
+# local time) se banta hai, isliye yahan +5:30 NAHI jodna hai - jodne par time
+# double-shifted (galat) dikhega.
+def format_plan_expiry(dt):
     """Premium expiry ko sundar padhne-yogya string mein render karta hai"""
     return dt.strftime("%d %B %Y, %I:%M %p") if dt else "Unknown"
 
@@ -97,14 +101,14 @@ async def check_premium_expired(bot):
                             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 Buy Premium Plan", callback_data="buy_prem")]])
                         )
                     except: pass
-                    await db.update_plan(uid, {"expire": None, "plan": "", "premium": False, "reminded_12h": False, "reminded_6h": False, "reminded_3h": False, "reminded_1h": False, "reminded_30m": False, "reminded_10m": False, "last_reminder_id": 0})
+                    await db.update_plan(uid, dict(RESET_PLAN_STATUS))
                     continue
 
                 for min_t, max_t, flag, text in intervals:
                     if min_t <= left_mins <= max_t and not mp.get(flag):
                         if mp.get("last_reminder_id"): await safe_del(bot, uid, [mp.get("last_reminder_id")])
                         try:
-                            msg = await bot.send_message(uid, text.format(get_ist_str(exp)), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 Renew Now", callback_data="buy_prem")]]))
+                            msg = await bot.send_message(uid, text.format(format_plan_expiry(exp)), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 Renew Now", callback_data="buy_prem")]]))
                             mp.update({flag: True, "last_reminder_id": msg.id})
                             await db.update_plan(uid, mp)
                         except: pass
@@ -132,7 +136,7 @@ async def myplan_cmd(c, m):
     exp = parse_expire_time(mp.get("expire"))
     now = get_local_now()
     left = f"{(exp - now).days} days, {(exp - now).seconds // 3600} hours" if exp else "Unknown"
-    await m.reply(f"💎 <b>Premium Status Summary</b>\n\n📦 <b>Plan Active:</b> {mp.get('plan')}\n🗓 <b>Expires On:</b> {get_ist_str(exp)}\n⏲ <b>Time Remaining:</b> {left}", quote=True)
+    await m.reply(f"💎 <b>Premium Status Summary</b>\n\n📦 <b>Plan Active:</b> {mp.get('plan')}\n🗓 <b>Expires On:</b> {format_plan_expiry(exp)}\n⏲ <b>Time Remaining:</b> {left}", quote=True)
 
 @Client.on_message(filters.command("plan") & filters.private)
 async def plan_cmd(c, m):
@@ -152,8 +156,8 @@ async def manage_premium(c, m):
     if is_add:
         if days <= 0: return await m.reply("❌ <b>Error:</b> Days must be at least 1.")
         ex = get_local_now() + timedelta(days=days)
-        data = {"expire": ex.strftime("%Y-%m-%d %H:%M:%S"), "plan": f"{days} Days", "premium": True, "reminded_12h": False, "reminded_6h": False, "reminded_3h": False, "reminded_1h": False, "reminded_30m": False, "reminded_10m": False, "last_reminder_id": 0}
-        m_usr, m_adm = f"🎉 <b>Premium Plan Activated!</b>\n\n🗓 <b>Duration Added:</b> {days} Days\n📅 <b>Expires On:</b> {get_ist_str(ex)}\n\nEnjoy our superfast streaming services! ❤️", f"✅ Added {days} days premium to token `{uid}`."
+        data = {**RESET_PLAN_STATUS, "expire": ex.strftime("%Y-%m-%d %H:%M:%S"), "plan": f"{days} Days", "premium": True}
+        m_usr, m_adm = f"🎉 <b>Premium Plan Activated!</b>\n\n🗓 <b>Duration Added:</b> {days} Days\n📅 <b>Expires On:</b> {format_plan_expiry(ex)}\n\nEnjoy our superfast streaming services! ❤️", f"✅ Added {days} days premium to token `{uid}`."
     else:
         data, m_usr, m_adm = {"expire": None, "plan": "", "premium": False}, "❌ <b>Your Premium Access has been Removed by Admin.</b>", f"🗑 Revoked premium privileges from token `{uid}`."
 
@@ -209,7 +213,7 @@ async def myplan_cb(client, query):
     exp = parse_expire_time(mp.get('expire'))
     now = get_local_now()
     left = f"{(exp - now).days} days, {(exp - now).seconds//3600} hours" if exp else "Unknown"
-    await query.message.edit_caption(f"💎 <b>Premium Subscription Status</b>\n\n📦 Plan Model: {mp.get('plan')}\n⏳ Expires: {get_ist_str(exp)}\n⏱ Duration Left: {left}\n\nUse /plan to extend duration.", reply_markup=InlineKeyboardMarkup(btn))
+    await query.message.edit_caption(f"💎 <b>Premium Subscription Status</b>\n\n📦 Plan Model: {mp.get('plan')}\n⏳ Expires: {format_plan_expiry(exp)}\n⏱ Duration Left: {left}\n\nUse /plan to extend duration.", reply_markup=InlineKeyboardMarkup(btn))
 
 @Client.on_callback_query(filters.regex(r"^(buy_prem|activate_plan)$"))
 async def buy_callback(c, q):
@@ -255,9 +259,9 @@ async def pay_action(c, q):
     if act == "confirm":
         days = int(tokens[3])
         ex = get_local_now() + timedelta(days=days)
-        await db.update_plan(uid, {"expire": ex.strftime("%Y-%m-%d %H:%M:%S"), "plan": f"{days} Days", "premium": True, "reminded_12h": False, "reminded_6h": False, "reminded_3h": False, "reminded_1h": False, "reminded_30m": False, "reminded_10m": False, "last_reminder_id": 0})
+        await db.update_plan(uid, {**RESET_PLAN_STATUS, "expire": ex.strftime("%Y-%m-%d %H:%M:%S"), "plan": f"{days} Days", "premium": True})
         await q.message.edit_caption(caption=q.message.caption + f"\n\n✅ <b>Approved by:</b> {q.from_user.mention}", reply_markup=None)
-        try: await c.send_message(uid, f"🎉 <b>Congratulations Member!</b>\n\n✅ Your premium plan of <b>{days} Days</b> is successfully Active.\n📅 <b>Expires On:</b> {get_ist_str(ex)}\n\nEnjoy our lightning fast search, streaming & download benefits! ❤️")
+        try: await c.send_message(uid, f"🎉 <b>Congratulations Member!</b>\n\n✅ Your premium plan of <b>{days} Days</b> is successfully Active.\n📅 <b>Expires On:</b> {format_plan_expiry(ex)}\n\nEnjoy our lightning fast search, streaming & download benefits! ❤️")
         except: pass
     else:
         await q.message.edit_caption(caption=q.message.caption + f"\n\n❌ <b>Rejected by:</b> {q.from_user.mention}", reply_markup=None)

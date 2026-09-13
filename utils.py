@@ -1,27 +1,35 @@
 import logging
-import asyncio
 import re
 import time
 import gc
 import pytz
-from datetime import datetime, timedelta
-from hydrogram.errors import FloodWait
+from datetime import datetime
 from hydrogram import enums
 
 from info import ADMINS, IS_PREMIUM, TIME_ZONE
-from database.users_chats_db import db
+# ✅ DRY: premium plan का reset-state dict database layer से ही आता है (एक ही जगह
+# define है), ताकि utils/premium/users_chats_db तीनों में वही 11 keys रहें।
+from database.users_chats_db import db, DEFAULT_PLAN_STATUS as RESET_PLAN_STATUS
 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
 # 🧠 TEMP RUNTIME STORAGE (Central context bucket)
+# ✅ FIX: USER_SESSIONS और REG_PENDING पहले यहाँ declared नहीं थे — login_routes.py
+# में `hasattr()` चेक करके runtime पर बनाए जाते थे, और web_assets.py / dashboard_
+# routes.py / users_chats_db.py में फिर `hasattr()` से पढ़े जाते थे। उसका नतीजा यह
+# था कि पहले login से पहले users_chats_db.get_today_logged_in_users_count() का
+# RAM-session वाला हिस्सा चुपचाप skip हो जाता था। अब सारे buckets एक ही जगह
+# declared हैं, इसलिए कहीं भी hasattr guard की ज़रूरत नहीं।
 # ─────────────────────────────────────────────
 class temp(object):
     START_TIME = 0
     BANNED_USERS, BANNED_CHATS = [], []
     ME, BOT, U_NAME, B_NAME = None, None, None, None
-    CANCEL = False 
+    CANCEL = False
     ADMIN_TOKENS, ADMIN_SESSIONS, FILES, PM_FILES = {}, {}, {}, {}
+    USER_SESSIONS = {}   # web dashboard login sessions  (web/login_routes.py)
+    REG_PENDING = {}     # web registration OTP flow      (web/login_routes.py)
 
 # ─────────────────────────────────────────────
 # 🛡️ RATE LIMITER UTILITY (Aggressive RAM Flush Sync)
@@ -85,37 +93,31 @@ async def is_premium(user_id, bot=None):
     if not mp.get("premium"): 
         return False
     
-    expire = mp.get("expire")
-    if expire:
-        if isinstance(expire, str):
-            try: 
-                expire = datetime.strptime(expire, "%Y-%m-%d %H:%M:%S")
-            except: 
-                expire = None
-        
+    raw_expire = mp.get("expire")
+    if raw_expire:
+        # ✅ DRY: पहले यहाँ strptime try/except inline लिखा था, जो utils के ही
+        # parse_expire_time() की हुबहू कॉपी थी — अब वही helper इस्तेमाल होता है।
+        expire = parse_expire_time(raw_expire)
         # ✅ FIX: हार्डकोडिंग हटाकर 'info.py' के कस्टमाइज्ड 'TIME_ZONE' से शुद्ध सिंक कॉम्पैरिजन
         now_local = get_local_now()
-        
+
+        # नोट: unparseable expire string भी reset trigger करती है (पहले जैसा ही) —
+        # वरना corrupt record वाला user हमेशा के लिए free premium पर रह जाता।
         if not expire or expire < now_local:
             if bot:
-                try: 
-                    await bot.send_message(user_id, f"❌ <b>Your Premium Membership Plan has Expired!</b>\n\nContact Admin or use /plan to activate again.")
-                except: 
+                try:
+                    await bot.send_message(
+                        user_id,
+                        "❌ <b>Your Premium Membership Plan has Expired!</b>\n\n"
+                        "Contact Admin or use /plan to activate again."
+                    )
+                except:
                     pass
-            
-            # प्रीमियम ख़त्म होते ही डेटाबेस में सारे रिमाइंडर फ़्लैग्स और स्टेटस को तुरंत रिफ्रेश/रीसेट करें
-            await db.update_plan(user_id, {
-                "expire": None, 
-                "plan": "", 
-                "premium": False,
-                "reminded_12h": False, 
-                "reminded_6h": False, 
-                "reminded_3h": False, 
-                "reminded_1h": False, 
-                "reminded_30m": False, 
-                "reminded_10m": False,
-                "last_reminder_id": 0
-            })
+
+            # प्रीमियम ख़त्म होते ही डेटाबेस में सारे रिमाइंडर फ़्लैग्स और स्टेटस को तुरंत
+            # रिफ्रेश/रीसेट करें। ✅ DRY: यह 11-key वाला ब्लॉक पहले यहाँ + premium.py में
+            # 3 बार कॉपी था, अब database.users_chats_db.DEFAULT_PLAN_STATUS से आता है।
+            await db.update_plan(user_id, dict(RESET_PLAN_STATUS))
             return False
     return True
 
@@ -169,6 +171,28 @@ def get_readable_time(seconds):
             res += f"{int(val)}{name} "
     return res.strip() or "0s"
 
+def get_duration_str(seconds):
+    """Video/audio duration ko media-player style string me badalta hai.
+
+    get_readable_time() se jaan-boojhkar alag hai: wo "1h 2m 3s" deta hai (uptime ke
+    liye), jabki video cards par duniya bhar me "1:02:03" chalta hai.
+    - duration na ho / 0 ho to "" (khali) — UI me chip hi nahi banega, "0:00" jaisa
+      bekaar text nahi dikhega.
+    - 1 ghante se chhota:  "M:SS"      (e.g. 12:34)
+    - 1 ghante ya zyada:   "H:MM:SS"   (e.g. 1:02:03)
+    """
+    try:
+        total = int(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if total <= 0:
+        return ""
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
 def get_wish():
     # ✅ FIX: कचरा टेक्स्ट और अशुद्धियों को हटाकर कस्टमाइज्ड टाइमज़ोन विश इंजन सिंक किया गया
     tz = pytz.timezone(TIME_ZONE)
@@ -209,9 +233,11 @@ def parse_expire_time(e):
     except: 
         return None
 
-def get_ist_str(dt):
-    # ग्लोबल रिफॉर्मेटेड पठनीय स्ट्रिंग रिपॉजिटरी रेंडरर
-    return (dt + timedelta(hours=5, minutes=30)).strftime("%d %B %Y, %I:%M %p") if dt else "Unknown"
+# ❌ DEAD CODE REMOVED: यहाँ एक get_ist_str() था जो dt में +5:30 जोड़कर फॉर्मेट
+# करता था। पूरे repo में इसकी एक भी call नहीं थी (plugins/premium.py का अपना
+# format_plan_expiry() ही असली इस्तेमाल होता है, और वो +5:30 नहीं जोड़ता क्योंकि
+# premium का expire पहले से local time में स्टोर है)। नाम एक जैसा होने से यह सिर्फ़
+# confusion पैदा करता था, इसलिए हटा दिया गया।
 
 async def safe_del(c, cid, mids):
     try: 

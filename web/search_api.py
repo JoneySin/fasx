@@ -9,30 +9,24 @@ import hashlib
 import asyncio
 import logging
 import urllib.parse
-import orjson
 from lru import LRU
 from aiohttp import web
 
 # कस्टमाइज्ड कोर यूटिल्स और कन्फर्म कंट्रोल्स इम्पोर्ट्स
-from utils import temp, get_size, is_premium
+from utils import temp, get_size, is_premium, get_duration_str
 # ✅ SYNC: THUMBNAIL_STORAGE_CHANNEL को इम्पोर्ट किया गया है पृथक स्टोरेज के लिए
-from info import BIN_CHANNEL, ADMINS, BOT_TOKEN, MAX_WEB_RESULTS, MAX_THUMB_CACHE, IS_PREMIUM, USE_CAPTION_FILTER, THUMBNAIL_STORAGE_CHANNEL
+from info import BIN_CHANNEL, ADMINS, BOT_TOKEN, MAX_WEB_RESULTS, MAX_THUMB_CACHE, IS_PREMIUM, THUMBNAIL_STORAGE_CHANNEL
 # यहाँ db_stats के लिए 'db as filter_db' ऐड किया गया है
 from database.ia_filterdb import COLLECTIONS, get_search_results, get_recent_files, db as filter_db, delete_single_file
 from database.users_chats_db import db
 # ✅ SYNC FIX: cookie-session identity check अब यहाँ दोबारा नहीं लिखा, web_assets से reuse हो रहा है
-from web.web_assets import get_auth as web_get_auth
+# ✅ DRY: fast_json भी अब web_assets से ही आता है (पहले search_api/actor_routes/
+# post_routes तीनों में इसकी अलग-अलग copy थी)।
+from web.web_assets import get_auth as web_get_auth, fast_json
 
 logger = logging.getLogger(__name__)
 
 search_routes = web.RouteTableDef()
-
-# ─────────────────────────────────────────────────────────
-# ⚡ ULTRA-FAST ORJSON DUMP FUNCTION
-# ─────────────────────────────────────────────────────────
-def fast_json(data):
-    """orjson बाइट्स (bytes) में डेटा देता है, aiohttp के लिए इसे स्ट्रिंग में डिकोड करना होता है"""
-    return orjson.dumps(data).decode('utf-8')
 
 # ✅ BUG FIX: यह duplicate function हटाया गया।
 # ia_filterdb.py के get_search_results()/_search() पहले से ही raw query से
@@ -79,7 +73,7 @@ async def _get_or_fetch_thumb(fid, col_name="primary", is_retry=False):
 
             async def _fetch():
                 target_collection = COLLECTIONS.get(col_name, COLLECTIONS["primary"])
-                existing = await target_collection.find_one({"_id": fid}, {"thumb_url": 1})
+                existing = await target_collection.find_one({"_id": fid}, {"thumb_url": 1, "duration": 1})
 
                 if existing and existing.get("thumb_url", "").startswith("TG_ID:"):
                     saved_thumb_id = existing["thumb_url"].replace("TG_ID:", "")
@@ -96,6 +90,12 @@ async def _get_or_fetch_thumb(fid, col_name="primary", is_retry=False):
                     try:
                         msg = await temp.BOT.send_cached_media(chat_id=BIN_CHANNEL, file_id=fid)
                         thumb_id = None
+
+                        # ✅ NEW: purane (duration ke bina index huye) docs ke liye free
+                        # backfill — yeh msg hum thumbnail ke liye waise hi bhejte hain,
+                        # isliye extra Telegram API call ya DB read nahi lagti. Sirf tab
+                        # likhte hain jab doc me duration abhi maujood na ho.
+                        await _backfill_duration(target_collection, fid, existing, msg)
 
                         if msg.video and msg.video.thumbs and len(msg.video.thumbs) > 0:
                             thumb_id = msg.video.thumbs[0].file_id
@@ -135,6 +135,26 @@ async def _get_or_fetch_thumb(fid, col_name="primary", is_retry=False):
 
     finally:
         thumb_locks.pop(cache_key, None)
+
+
+# ─────────────────────────────────────────────────────────
+# ⏱️ DURATION LAZY BACKFILL (purani files ke liye, bina extra API call)
+# ─────────────────────────────────────────────────────────
+async def _backfill_duration(col, fid, existing, msg):
+    """Thumbnail msg se video duration nikalkar DB me save karta hai (sirf agar missing ho).
+
+    Fail hone par thumbnail flow ko bilkul nahi rokta — duration sirf ek cosmetic
+    web-UI field hai, iske liye poster serve karna band nahi hona chahiye.
+    """
+    try:
+        if existing and existing.get("duration"):
+            return  # pehle se maujood hai, dobara likhne ki zaroorat nahi
+        media = getattr(msg, msg.media.value, None) if getattr(msg, "media", None) else None
+        duration = int(getattr(media, "duration", 0) or 0)
+        if duration > 0:
+            await col.update_one({"_id": fid}, {"$set": {"duration": duration}})
+    except Exception as e:
+        logger.debug(f"Duration backfill skipped for {fid}: {e}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -248,6 +268,9 @@ def _build_results_list(all_m, mode):
             "file_id": db_id,
             "name": d.get("file_name", "Unknown File"),
             "size": get_size(d.get("file_size", 0)),
+            # ✅ NEW: video duration (e.g. "1:02:03"). Purani/unindexed files me duration
+            # 0 hota hai, tab khali string jaati hai aur UI me chip ban hi nahi.
+            "duration": get_duration_str(d.get("duration")),
             "type": d.get("file_type", "document").upper(),
             "source": source_collection_name.capitalize(),
             "raw_collection": source_collection_name,
@@ -369,7 +392,24 @@ async def get_telegram_thumb(req):
 
 # ─────────────────────────────────────────────────────────
 # 🎥 STREAM SETUP PIPELINE
+# ✅ DRY: GET और POST दोनों versions में वही 4-step tunnel logic (send_cached_media
+# → delete-queue → play-count → URL बनाना) दो बार लिखा था। अब सिर्फ़ input parsing
+# और response format अलग है, असली काम एक ही _tunnel_stream() करता है।
 # ─────────────────────────────────────────────────────────
+def stream_target_path(msg_id: int, mode: str) -> str:
+    """watch/download mode को सही route path में बदलता है (unknown mode → watch)"""
+    return f"/{'download' if mode == 'download' else 'watch'}/{msg_id}"
+
+
+async def _tunnel_stream(fid: str, mode: str) -> str:
+    """BIN_CHANNEL में file भेजकर उसका watch/download path लौटाता है"""
+    msg = await temp.BOT.send_cached_media(chat_id=BIN_CHANNEL, file_id=fid)
+    await db.add_to_delete_queue(BIN_CHANNEL, msg.id, 3600)
+    if mode == "watch":
+        await db.track_video_play()
+    return stream_target_path(msg.id, mode)
+
+
 @search_routes.get("/setup_stream")
 async def setup_stream(req):
     role, _ = await get_user_role(req)
@@ -380,11 +420,7 @@ async def setup_stream(req):
     if not fid:
         return web.Response(text="❌ Missing file_id!", status=400)
     try:
-        msg = await temp.BOT.send_cached_media(chat_id=BIN_CHANNEL, file_id=fid)
-        await db.add_to_delete_queue(BIN_CHANNEL, msg.id, 3600)
-        if mode == "watch":
-            await db.track_video_play()
-        return web.HTTPFound(f"/{'download' if mode == 'download' else 'watch'}/{msg.id}")
+        return web.HTTPFound(await _tunnel_stream(fid, mode))
     except Exception as e:
         return web.Response(text=f"❌ Error Tunneling Stream: {e}", status=500)
 
@@ -404,11 +440,7 @@ async def setup_stream_post(req):
     if not fid:
         return web.json_response({"error": "Missing file_id!"}, status=400, dumps=fast_json)
     try:
-        msg = await temp.BOT.send_cached_media(chat_id=BIN_CHANNEL, file_id=fid)
-        await db.add_to_delete_queue(BIN_CHANNEL, msg.id, 3600)
-        if mode == "watch":
-            await db.track_video_play()
-        return web.json_response({"url": f"/{'download' if mode == 'download' else 'watch'}/{msg.id}"}, dumps=fast_json)
+        return web.json_response({"url": await _tunnel_stream(fid, mode)}, dumps=fast_json)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500, dumps=fast_json)
 
@@ -592,10 +624,10 @@ async def api_flush_cache(req):
 
 @search_routes.get("/miniapp")
 async def miniapp_page(req):
+    # ❌ DEAD CODE REMOVED: पहले "web/" न मिलने पर "Web/" (capital W) fallback भी
+    # चेक होता था, पर repo में ऐसा कोई directory है ही नहीं — वह शाखा कभी नहीं चलती थी।
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     html_path = os.path.join(base_dir, "web", "miniapp.html")
-    if not os.path.exists(html_path):
-        html_path = os.path.join(base_dir, "Web", "miniapp.html")
     if not os.path.exists(html_path):
         return web.Response(text="miniapp.html page template not found.", status=404)
     return web.FileResponse(html_path)

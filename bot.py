@@ -3,7 +3,6 @@ import asyncio
 import signal
 import os
 import time
-import sys
 import gc
 from typing import Union, AsyncGenerator
 from datetime import datetime
@@ -49,15 +48,11 @@ from database.users_chats_db import db
 from database.ia_filterdb import ensure_indexes
 from plugins.premium import check_premium_expired
 
-# ==========================================================
-# 🛠️ HEALTH CHECK ENDPOINT (Koyeb Dynamic Health Check OK)
-# ==========================================================
-routes = web.RouteTableDef()
-
-@routes.get("/health")
-async def health_check(request):
-    uptime = time.time() - temp.START_TIME
-    return web.json_response({"status": "healthy", "uptime": f"{uptime:.2f}s"})
+# ❌ DEAD CODE REMOVED: यहाँ एक `/health` route था, पर web/dashboard_routes.py में
+# भी वही route रजिस्टर है। web/__init__.py का register_admin_components() इस
+# RouteTableDef से पहले चलता है, इसलिए dashboard वाला ही match होता था और यह
+# handler कभी execute नहीं होता था (aiohttp first-match-wins)। अब /health एक ही
+# जगह है (dashboard_routes) और उसी में uptime भी शामिल कर दिया गया है।
 
 # ==========================================================
 # ⏳ SMART AUTO-DELETE BACKGROUND WORKER (RAM Protected)
@@ -170,7 +165,6 @@ class Bot(Client):
         temp.B_NAME = me.first_name
 
         # 7. Start Web Server with Health Routes (Combined Non-Blocking Engine Loop)
-        web_app.add_routes(routes)
         self._runner = web.AppRunner(web_app, access_log=None)
         await self._runner.setup()
         await web.TCPSite(self._runner, "0.0.0.0", PORT).start()

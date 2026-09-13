@@ -1,22 +1,19 @@
-import io, gc, time, html, re
+import io, time, html, re
 import asyncio
 import aiohttp
-import orjson
 from aiohttp import web
 from bson.objectid import ObjectId
 from utils import temp
 from info import THUMBNAIL_STORAGE_CHANNEL
-from database.users_chats_db import db as motor_db
-from web.web_assets import build_page, get_auth, require_active_plan
+# ✅ DRY: Posts collection handle अब ia_filterdb से आता है — पहले यहाँ अलग से
+# `motor_db.db["Posts"]` बनाया जाता था, जबकि ia_filterdb.py में वही collection
+# पहले से मौजूद था (और उस पर text index भी बनता है)। दो handle एक ही collection
+# पर रखने का कोई फायदा नहीं था।
+from database.ia_filterdb import posts as posts_col
+# ✅ DRY: fast_json + DIRECTORY_CSS अब web_assets से आते हैं (पहले दोनों यहाँ copy थे)
+from web.web_assets import build_page, get_auth, require_active_plan, fast_json, DIRECTORY_CSS
 
 post_routes = web.RouteTableDef()
-posts_col = motor_db.db["Posts"]
-
-# ─────────────────────────────────────────────────────────
-# ⚡ ULTRA-FAST ORJSON DUMP FUNCTION
-# ─────────────────────────────────────────────────────────
-def fast_json(data):
-    return orjson.dumps(data).decode('utf-8')
 
 # ─────────────────────────────────────────────────────────
 # 🛠️ ImgBB Auto-Converter Helper Functions
@@ -449,7 +446,6 @@ async def get_post_photo(req):
         file_data.close()
         return web.Response(body=body_bytes, content_type="image/jpeg", headers={"Cache-Control": "public, max-age=31536000"})
     except: return web.Response(status=500)
-    finally: gc.collect()
 
 # ─────────────────────────────────────────────────────────
 # 🌐 5. PUBLIC ROUTE: POSTS DIRECTORY GRID (UPDATE SEARCH UI)
@@ -467,41 +463,7 @@ async def posts_directory_page(req):
     admin_btn = '''<button onclick="window.location.href='/admin/create_post'" style="background:var(--accent); color:#fff; border:none; padding:10px 15px; border-radius:8px; font-weight:800; cursor:pointer; font-size:13px; flex:1; min-width:130px; box-shadow:0 4px 15px rgba(229,9,20,0.3); transition:0.2s;">➕ Create</button>''' if role == 'admin' else ""
     
     search_ui = f'''
-    <style>
-        .dir-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }} 
-        @media(min-width: 768px) {{ 
-            .dir-grid {{ grid-template-columns: repeat(5, 1fr); gap: 20px; }} 
-        }} 
-        .search-box {{ background:var(--card); border:1px solid var(--border); padding:16px; border-radius:12px; margin-bottom:25px; box-shadow:0 4px 15px rgba(0,0,0,0.1); }} 
-        .s-row-1 {{ display: flex; gap: 10px; margin-bottom: 12px; position: relative; }}
-        .s-input {{ flex: 1; background:var(--bg3); border:1px solid var(--border); padding:12px 16px; color:var(--text); border-radius:8px; outline:none; font-family:inherit; font-weight:600; font-size:14px; transition:0.2s; }}
-        .s-input:focus {{ border-color:var(--accent); }}
-        .s-spinner {{ display:none; position:absolute; right:14px; top:50%; transform:translateY(-50%); width:16px; height:16px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:sSpin .6s linear infinite; }}
-        .s-row-1.loading .s-spinner {{ display:block; }}
-        @keyframes sSpin {{ to {{ transform:translateY(-50%) rotate(360deg); }} }}
-        .s-btn {{ background:var(--accent); color:#fff; border:none; padding:0 24px; border-radius:8px; font-weight:800; cursor:pointer; transition:0.2s; white-space:nowrap; }}
-        .s-btn:hover {{ background:var(--accent-hover); transform:scale(1.02); }}
-        
-        .s-row-2 {{ display: flex; gap: 10px; flex-wrap:wrap; align-items:center; }}
-        .cdd-wrap {{ position: relative; background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; cursor: pointer; font-weight: 700; font-size: 13px; color: var(--text); flex: 1; min-width: 100px; display: flex; justify-content: space-between; align-items: center; user-select: none; transition:0.2s; }}
-        .cdd-wrap:hover {{ border-color: var(--accent); }}
-        .cdd-menu {{ position: absolute; top: calc(100% + 5px); left: 0; right: 0; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; z-index: 100; display: none; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }}
-        .cdd-item {{ padding: 10px 14px; border-bottom: 1px solid var(--border); transition: 0.2s; }}
-        .cdd-item:last-child {{ border-bottom: none; }}
-        .cdd-item:hover {{ background: var(--bg3); color: var(--accent); }}
-        
-        .pg-bar {{ display:flex; justify-content:center; align-items:center; gap:15px; margin-top:30px; }}
-        .pg-btn {{ background:var(--bg4); color:var(--text); border:1px solid var(--border); padding:8px 20px; border-radius:6px; font-weight:700; cursor:pointer; font-size:13px; transition:0.2s; }}
-        .pg-btn:hover:not(:disabled) {{ background:var(--accent); color:#fff; border-color:var(--accent); }}
-        .pg-btn:disabled {{ opacity:0.4; cursor:not-allowed; }}
-        .pg-info {{ color:var(--text); font-weight:800; font-size:14px; background:var(--bg3); padding:6px 14px; border-radius:6px; border:1px solid var(--border); }}
-        
-        /* 📄 Text View CSS overrides */
-        .card-body {{ display: none; }}
-        .grid-text-mode .poster-wrap {{ display: none !important; }}
-        .grid-text-mode .act-card {{ display:flex; align-items:center; padding:5px; background:var(--card); }}
-        .grid-text-mode .card-body {{ display: block !important; text-align:left !important; padding:10px 15px !important; flex:1; }}
-    </style>
+    {DIRECTORY_CSS}
     
     <div class="search-box">
         <div class="s-row-1" id="postSearchRow">

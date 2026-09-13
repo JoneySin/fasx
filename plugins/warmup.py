@@ -8,7 +8,7 @@ from hydrogram import Client, filters
 from hydrogram.errors import FloodWait, MessageNotModified, BadRequest
 from info import ADMINS, BIN_CHANNEL, THUMBNAIL_STORAGE_CHANNEL
 from utils import get_readable_time
-from database.ia_filterdb import COLLECTIONS
+from database.ia_filterdb import FILE_COLLECTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -20,17 +20,17 @@ def get_warmup_ui(col_name, processed, total, success, skipped, elapsed, eta, sp
     dot = "🔴" if percent < 30 else ("🟡" if percent < 70 else "🟢")
     
     lines = [
-        f"🎬 <b>FAST FINDER - THUMBNAIL WARMUP CONSOLE</b>",
-        f"──────────────────────────────",
+        "🎬 <b>FAST FINDER - THUMBNAIL WARMUP CONSOLE</b>",
+        "──────────────────────────────",
         f"📁 <b>Repository Hub :</b> <code>{col_name.upper()}</code>",
         f"📈 <b>Pipeline Index :</b> <code>{processed:,} / {total:,}</code>",
         f"🔒 <b>Strict Locked  :</b> <code>{success:,} Thumbs</code>",
         f"⚠️ <b>Rejected/Web   :</b> <code>{skipped:,} Files</code>",
         f"⏱️ <b>Time Remaining :</b> <code>{get_readable_time(eta)}</code>",
         f"⚡ <b>Stream Velocity:</b> <code>{speed:.1f} f/min</code>",
-        f"──────────────────────────────",
+        "──────────────────────────────",
         f"{dot} <b>Core Progress Matrix:</b> <code>| {percent}% Synced |</code>",
-        f"\n<i>📡 Logs are streaming live on Koyeb Console!</i>"
+        "\n<i>📡 Logs are streaming live on Koyeb Console!</i>"
     ]
     return "\n".join(lines)
 
@@ -51,21 +51,17 @@ async def start_warmup_engine(client, status_msg, user_id):
     }
 
     # पेंडिंग काउंट्स सिंक फेज
-    # ✅ BUG FIX: COLLECTIONS dict में "actors" भी शामिल है (actor profile records),
-    # जिनका schema फाइलों जैसा (file_ref/file_id/file_name) नहीं है। actors को शामिल
-    # रखने पर उनके पास "thumb_url" फील्ड ही न होने से हर actor doc इस query में
-    # गलती से मैच हो जाता (MongoDB में $ne/$not किसी missing field को भी match कर
-    # लेते हैं) — जिससे actor का ObjectId एक invalid Telegram file_id की तरह भेजने
-    # की कोशिश होती, बेवजह API कॉल्स और error-log waste होते। यही exclusion पहले
-    # से ia_filterdb.delete_files() में मौजूद है (name != "actors"), यहाँ भी वही लगाया।
-    total_to_process = 0
-    col_counts = {}
-    for name, collection in COLLECTIONS.items():
-        if name == "actors":
-            continue
-        count = await collection.count_documents(query)
-        col_counts[name] = count
-        total_to_process += count
+    # ✅ DRY: actors-exclusion अब ia_filterdb.FILE_COLLECTIONS में एक ही जगह है।
+    # पहले यहाँ COLLECTIONS पर लूप चलाकर हर बार `if name == "actors": continue`
+    # लिखा जाता था (दो बार) — एक जगह छूट जाने पर actor के ObjectId को Telegram
+    # file_id समझकर भेजा जाता (MongoDB में $ne/$not missing field को भी match करते
+    # हैं), जिससे बेवजह API कॉल्स और error-log waste होता था।
+    # ⚡ FAST: तीनों count_documents अब parallel हैं (पहले sequential थे)।
+    counts = await asyncio.gather(
+        *[col.count_documents(query) for col in FILE_COLLECTIONS.values()]
+    )
+    col_counts = dict(zip(FILE_COLLECTIONS.keys(), counts))
+    total_to_process = sum(col_counts.values())
 
     if total_to_process == 0:
         return await status_msg.edit(
@@ -82,9 +78,7 @@ async def start_warmup_engine(client, status_msg, user_id):
     processed, success, skipped = 0, 0, 0
     start_time = time.time()
 
-    for col_name, collection in COLLECTIONS.items():
-        if col_name == "actors":
-            continue
+    for col_name, collection in FILE_COLLECTIONS.items():
         if col_counts[col_name] == 0:
             continue
 

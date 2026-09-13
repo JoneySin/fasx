@@ -91,19 +91,23 @@ Choose a category below. 👇</b>"""
 • /web_users - Web users
 • /warmup_thumbs - Refresh thumbnails
 • /restart - Restart bot
+• /users - Export users.txt backup
+• /chats - Export chats.txt backup
 
-<blockquote><b>⚙️ <u>Group Management Guide:</u> 👇</b></blockquote>
+<blockquote><b>🛠️ <u>Bot Maintenance:</u> 👇</b></blockquote>
+
+• /leave &lt;chat_id&gt; - Leave a chat
+• /invite_link &lt;chat_id&gt; - Generate invite link
+• /ban_grp | /unban_grp &lt;id&gt; [reason] - Ban / unban a group
+• /ban_user | /unban_user &lt;id&gt; [reason] - Ban / unban a user
+• /check_db - Primary → cloud migration check
+• /cancel - Cancel a running /check_db
+
+<blockquote><b>⚙️ <u>Group Commands:</u> 👇</b></blockquote>
 
 • /search - Auto Filter
 • /settings - Group settings
-• /button_style - Result style
-• /mute | /unmute - Mute user
-• /ban - Ban user
-• /warn | /resetwarn - Warnings
-• /addblacklist | /removeblacklist - Blacklist words
-• /blacklist - View blacklist
-• /dlink | /removedlink - Auto-delete words
-• /dlinklist - Delete triggers"""
+• /button_style - Result style"""
     
     PLAN_TXT = """💎 <b>Fast Finder Premium Plans</b> 💎
 
@@ -126,8 +130,7 @@ Activate a premium plan to unlock exclusive, high-speed features!
 • /plan - Premium plans
 • /myplan - Premium status
 • /id - User & Chat ID
-• /fileid - Media File ID
-• /ask or /ai - AI Assistant"""
+• /link - Watch & Download link (reply to media, Premium)"""
 
     LOG_INDEX_TXT = """📢 <b>#Indexing_Report 📊</b>
 
