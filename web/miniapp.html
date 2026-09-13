@@ -51,14 +51,26 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--txt);min-
 .page{display:none}.page.active{display:block}
 
 /* video results */
-.main{padding:12px 12px 0}
+.main{padding:12px 12px 0;max-width:1500px;margin:0 auto;width:100%}
+/* 🖥️ desktop: search bar + filters chhote rakho, poore screen pe mat phailao */
+@media(min-width:700px){.sr{max-width:600px}.fi{max-width:600px}}
 .rg{display:grid;grid-template-columns:1fr;gap:4px;margin-bottom:24px}
 @media(min-width:480px){.rg{grid-template-columns:repeat(2,1fr);gap:10px}}
+@media(min-width:700px){.rg{grid-template-columns:repeat(3,1fr);gap:12px}}
+@media(min-width:950px){.rg{grid-template-columns:repeat(4,1fr);gap:14px}}
+@media(min-width:1250px){.rg{grid-template-columns:repeat(5,1fr);gap:14px}}
+@media(min-width:1600px){.rg{grid-template-columns:repeat(6,1fr);gap:16px}}
 .rg.mn .pb{display:none}
 
 /* file card */
 .fc{background:var(--card);border-radius:8px;overflow:hidden;border:1px solid var(--br);cursor:pointer;transition:border-color .2s}
 .fc:active{border-color:rgba(229,9,20,.5);transform:scale(.96);transition:transform .1s}
+/* 🖥️ desktop: mouse hover pe card lift + title highlight */
+@media(hover:hover){
+  .fc{transition:border-color .2s,transform .2s}
+  .fc:hover{border-color:rgba(229,9,20,.55);transform:translateY(-3px)}
+  .fc:hover .fn{color:var(--ac)}
+}
 
 /* shimmer — shared by poster-box & act-card poster */
 @keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
@@ -144,6 +156,12 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--txt);min-
 .pab:active{opacity:.8}
 .dl{background:var(--ac);color:#fff}
 .cp{background:rgba(255,255,255,.1);color:#fff;border:1px solid rgba(255,255,255,.15)}
+/* 🖥️ desktop: bottom-sheet ki jagah center modal, full-width video na lage */
+@media(min-width:900px){
+  .ps{justify-content:center;align-items:center}
+  .pby{width:min(880px,92vw);max-height:86vh;border-radius:18px}
+  .ph{display:none}
+}
 </style>
 </head>
 <body>
