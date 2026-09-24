@@ -15,6 +15,17 @@ def fast_json(data):
     return orjson.dumps(data).decode('utf-8')
 
 # ─────────────────────────────────────────────
+# 🎛️ CENTRALIZED DEFAULT VIEW MODES
+# ✅ DRY: हर page (dashboard, posts, actors, actor-profile, miniapp) का default
+# view mode अब यहीं एक जगह से control होता है — बदलना हो तो सिर्फ़ ये दो lines।
+#
+# DEFAULT_CATALOG_MODE → /posts और /actors directory grids ('poster' | 'text')
+# DEFAULT_MEDIA_MODE   → dashboard, miniapp और actor-profile media results ('tg' | 'none')
+# ─────────────────────────────────────────────
+DEFAULT_CATALOG_MODE = "text"
+DEFAULT_MEDIA_MODE = "none"
+
+# ─────────────────────────────────────────────
 # 🎨 SHARED DIRECTORY CSS
 # ✅ DRY: /actors और /posts दोनों grid pages में यह ~24-rule CSS ब्लॉक हुबहू कॉपी
 # था। एक जगह भी class बदलने पर दूसरा पेज टूट जाता। अब दोनों इसी को embed करते हैं।
@@ -150,7 +161,7 @@ function toggleThemeFixed(){var l=document.documentElement.classList.toggle('lig
 function openSidebar(){document.getElementById('sidebar').classList.add('open');document.getElementById('sbOverlay').classList.add('open');document.getElementById('hamBtn').classList.add('open');}
 function closeSidebar(){document.getElementById('sidebar').classList.remove('open');document.getElementById('sbOverlay').classList.remove('open');document.getElementById('hamBtn').classList.remove('open');}
 var curQ='',curOff=0,nextOff='',curCol='all',curPage=1;
-var pMode=localStorage.getItem('posterMode')||'tg';
+var pMode=localStorage.getItem('posterMode')||'__DEFAULT_MEDIA_MODE__';
 var LIMIT_VAL = __LIMIT_PLACEHOLDER__;
 
 var activeFid = '', activeCol = '', cropperInstance = null;
@@ -320,7 +331,7 @@ function staggerCards(container){
     },{threshold:0.08});
     cards.forEach(function(c){ obs.observe(c); });
 }
-""".replace("__LIMIT_PLACEHOLDER__", str(MAX_WEB_RESULTS))
+""".replace("__LIMIT_PLACEHOLDER__", str(MAX_WEB_RESULTS)).replace("__DEFAULT_MEDIA_MODE__", DEFAULT_MEDIA_MODE)
 
 def _h(html): return web.Response(text=html.encode('utf-8','replace').decode('utf-8'), content_type='text/html', charset='utf-8')
 

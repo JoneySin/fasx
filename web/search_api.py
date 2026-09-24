@@ -22,7 +22,7 @@ from database.users_chats_db import db
 # ✅ SYNC FIX: cookie-session identity check अब यहाँ दोबारा नहीं लिखा, web_assets से reuse हो रहा है
 # ✅ DRY: fast_json भी अब web_assets से ही आता है (पहले search_api/actor_routes/
 # post_routes तीनों में इसकी अलग-अलग copy थी)।
-from web.web_assets import get_auth as web_get_auth, fast_json
+from web.web_assets import get_auth as web_get_auth, fast_json, DEFAULT_MEDIA_MODE
 
 logger = logging.getLogger(__name__)
 
@@ -292,7 +292,7 @@ async def api_search(req):
     q = req.query.get("q", "").strip()
     off = req.query.get("offset", "0")
     col = req.query.get("col", "all").lower()
-    mode = req.query.get("mode", "tg").lower()
+    mode = req.query.get("mode", DEFAULT_MEDIA_MODE).lower()
 
     try:
         off = max(0, int(off))
@@ -630,4 +630,8 @@ async def miniapp_page(req):
     html_path = os.path.join(base_dir, "web", "miniapp.html")
     if not os.path.exists(html_path):
         return web.Response(text="miniapp.html page template not found.", status=404)
-    return web.FileResponse(html_path)
+    # 🎛️ Centralized default view mode inject (DEFAULT_MEDIA_MODE — web_assets.py)
+    with open(html_path, "r", encoding="utf-8") as f:
+        html_src = f.read()
+    html_src = html_src.replace("__DEFAULT_MEDIA_MODE__", DEFAULT_MEDIA_MODE)
+    return web.Response(text=html_src, content_type="text/html", charset="utf-8")

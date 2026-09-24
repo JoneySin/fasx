@@ -11,7 +11,7 @@ from info import THUMBNAIL_STORAGE_CHANNEL
 # पर रखने का कोई फायदा नहीं था।
 from database.ia_filterdb import posts as posts_col
 # ✅ DRY: fast_json + DIRECTORY_CSS अब web_assets से आते हैं (पहले दोनों यहाँ copy थे)
-from web.web_assets import build_page, get_auth, require_active_plan, fast_json, DIRECTORY_CSS
+from web.web_assets import build_page, get_auth, require_active_plan, fast_json, DIRECTORY_CSS, DEFAULT_CATALOG_MODE
 
 post_routes = web.RouteTableDef()
 
@@ -472,7 +472,7 @@ async def posts_directory_page(req):
         </div>
         <div class="s-row-2">
             <div class="cdd-wrap" onclick="togglePostCDD('view', event)">
-                <span id="post_view_lbl">🖼️ Poster</span> <span style="font-size:10px; color:var(--muted);">▼</span>
+                <span id="post_view_lbl">{'📄 Text' if DEFAULT_CATALOG_MODE == 'text' else '🖼️ Poster'}</span> <span style="font-size:10px; color:var(--muted);">▼</span>
                 <div class="cdd-menu" id="post_view_menu">
                     <div class="cdd-item" onclick="pickPostView('poster', '🖼️ Poster', event)">🖼️ Poster</div>
                     <div class="cdd-item" onclick="pickPostView('text', '📄 Text', event)">📄 Text</div>
@@ -514,7 +514,8 @@ async def posts_directory_page(req):
             </div>
         </div>'''
     
-    initial_grid = f'<div id="post_grid_container" class="dir-grid">{post_items}</div>' if all_posts else '<div style="text-align:center; padding:60px 20px; color:var(--muted);">No posts found.</div>'
+    grid_mode_cls = ' grid-text-mode' if DEFAULT_CATALOG_MODE == 'text' else ''
+    initial_grid = f'<div id="post_grid_container" class="dir-grid{grid_mode_cls}">{post_items}</div>' if all_posts else '<div style="text-align:center; padding:60px 20px; color:var(--muted);">No posts found.</div>'
 
     has_nxt_str = "true" if has_next_init else "false"
 
@@ -529,24 +530,26 @@ async def posts_directory_page(req):
     var pOff = 0, pLim = 20, pPage = 1;
     var postReqId = 0;
     var pNext = {has_nxt_str};
-    var currentPCat = 'All'; var currentPView = 'poster';
-    var lastPQ = "", lastPCat = "All", lastPView = "poster", lastPOff = 0;
+    var currentPCat = 'All'; var currentPView = '{DEFAULT_CATALOG_MODE}';
+    var lastPQ = "", lastPCat = "All", lastPView = "{DEFAULT_CATALOG_MODE}", lastPOff = 0;
 
     document.addEventListener("DOMContentLoaded", () => {{
         if(sessionStorage.getItem('ff_post_state')) {{
             document.getElementById('post_q').value = sessionStorage.getItem('ff_post_q') || "";
             currentPCat = sessionStorage.getItem('ff_post_cat') || "All";
-            currentPView = sessionStorage.getItem('ff_post_view') || "poster";
+            currentPView = sessionStorage.getItem('ff_post_view') || "{DEFAULT_CATALOG_MODE}";
             pOff = parseInt(sessionStorage.getItem('ff_post_off') || "0");
             pPage = parseInt(sessionStorage.getItem('ff_post_page') || "1");
 
             const catMap = {{'All':'📁 All Categories', 'Movies':'🎬 Movies', 'Web Series':'📺 Web Series', 'App Video':'📱 App Video', 'Porn':'🔞 Porn'}};
             const viewMap = {{'poster':'🖼️ Poster', 'text':'📄 Text'}};
             document.getElementById('post_cat_lbl').innerText = catMap[currentPCat] || '📁 All Categories';
-            document.getElementById('post_view_lbl').innerText = viewMap[currentPView] || '🖼️ Poster';
+            document.getElementById('post_view_lbl').innerText = viewMap[currentPView] || viewMap['{DEFAULT_CATALOG_MODE}'];
 
+            applyPostViewMode();
             searchPosts(true);
         }} else {{
+            applyPostViewMode();
             updatePgUI();
             staggerCards(document.getElementById('post_grid_container'));
         }}
