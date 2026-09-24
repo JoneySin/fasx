@@ -107,7 +107,7 @@ function pickCol(val,label,el,e){
     el.classList.add('selected');
     document.getElementById('cddColMenu').style.display='none';
     document.getElementById('cddColBtn').classList.remove('open');
-    if(curQ)doSearch(0);
+    doSearch(0,true);
 }
 function pickMode(val,label,el,e){
     if(e){e.stopPropagation();}
@@ -118,7 +118,7 @@ function pickMode(val,label,el,e){
     el.classList.add('selected');
     document.getElementById('cddModeMenu').style.display='none';
     document.getElementById('cddModeBtn').classList.remove('open');
-    if(curQ)doSearch(curOff);
+    doSearch(curOff,true);
 }
 document.addEventListener('click',function(e){
     if(!e.target.closest('.cdd-wrap')){closeCdds();}
@@ -126,7 +126,7 @@ document.addEventListener('click',function(e){
 document.querySelectorAll('.cdd-menu').forEach(function(m){
     m.addEventListener('click',function(e){e.stopPropagation();});
 });
-function changeCol(val){curCol=val;if(curQ)doSearch(0);}
+function changeCol(val){curCol=val;doSearch(0,true);}
 
 /* ✅ DUPLICATE REMOVED: handleThumbError() यहाँ दोबारा defined था, जबकि
    web_assets.py के global JS में यह पहले से है (और वहाँ वाला version बेहतर है —
