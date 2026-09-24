@@ -322,7 +322,7 @@ async def actor_profile_display(req):
     s_html = "".join([f'<a href="{html.escape(social[k])}" target="_blank" style="background:{c}; color:#fff; padding:6px 14px; border-radius:6px; text-decoration:none; font-size:12px; font-weight:700;">{l}</a>' for k,c,l in [("instagram","#ff007f","📸 Instagram"),("youtube","#ff0000","📺 YouTube"),("twitter","#1da1f2","🐦 Twitter / X")] if social.get(k)])
     social_html = f'<div style="display:flex; gap:12px; margin-top:12px; flex-wrap:wrap;">{s_html}</div>'
     
-    gallery_grid_html = f'''<div style="background:var(--card); border:1px dashed var(--border); padding:20px; border-radius:8px; text-align:center; margin-bottom:20px;"><form action="/api/actor/gallery_upload" method="post" enctype="multipart/form-data" style="margin:0;"><input type="hidden" name="actor_id" value="{actor_id}"><label style="background:var(--accent); color:#fff; padding:10px 20px; border-radius:6px; font-weight:700; cursor:pointer; font-size:13px; display:inline-block;">📂 Add Image to Gallery<input type="file" name="gallery_img" accept="image/*" style="display:none;" onchange="this.form.submit()"></label></form></div>''' if role == 'admin' else ""
+    gallery_grid_html = f'''<div style="background:var(--card); border:1px dashed var(--border); padding:20px; border-radius:8px; text-align:center; margin-bottom:20px;"><form action="/api/actor/gallery_upload" method="post" enctype="multipart/form-data" style="margin:0;"><input type="hidden" name="actor_id" value="{actor_id}"><label style="background:var(--accent); color:#fff; padding:10px 20px; border-radius:6px; font-weight:700; cursor:pointer; font-size:13px; display:inline-block;">📂 Add Images to Gallery<input type="file" name="gallery_img" accept="image/*" multiple style="display:none;" onchange="this.form.submit()"></label><div style="color:var(--muted); font-size:11px; margin-top:8px;">You can select multiple photos at once</div></form></div>''' if role == 'admin' else ""
     if not gallery_list:
         gallery_grid_html += '<div style="color:var(--muted); text-align:center; padding:40px;"> 🖼️ Gallery is empty. Upload images to show here.</div>'
     else:
@@ -438,25 +438,43 @@ async def api_actor_gallery_upload(req):
     if role != 'admin': return web.json_response({"error": "Unauthorized"}, status=403, dumps=fast_json)
     try:
         reader = await req.multipart()
-        actor_id, image_bytes = None, None
+        actor_id, image_bytes_list = None, []
         while True:
             part = await reader.next()
             if part is None: break
-            if part.name == 'actor_id': actor_id = (await part.read()).decode().strip()
-            elif part.name == 'gallery_img': image_bytes = await part.read()
+            if part.name == 'actor_id':
+                actor_id = (await part.read()).decode().strip()
+            elif part.name == 'gallery_img':
+                image_bytes = await part.read()
+                if image_bytes:
+                    # With the `multiple` input attribute the browser sends one
+                    # multipart part per selected image, all with the same name.
+                    image_bytes_list.append(image_bytes)
             
-        if not actor_id or not image_bytes: return web.HTTPFound('/actors?err=Assets reading packet failure')
-        with io.BytesIO(image_bytes) as img_buffer:
-            img_buffer.name = f"gallery_{actor_id}_{int(time.time())}.jpg"
-            # ✅ UPGRADE: पुराने मिक्स्ड 'BIN_CHANNEL' के बजाय पृथक 'ACTOR_STORAGE_CHANNEL' का उपयोग
-            msg = await temp.BOT.send_photo(chat_id=ACTOR_STORAGE_CHANNEL, photo=img_buffer)
-            
-        if not msg or not msg.photo: return web.HTTPFound(f'/actor/{actor_id}?err=Telegram Node Gallery Upload Failed')
-        tg_photo_id = msg.photo.sizes[-1].file_id if hasattr(msg.photo, "sizes") and msg.photo.sizes else msg.photo.file_id
+        if not actor_id or not image_bytes_list:
+            return web.HTTPFound('/actors?err=Assets reading packet failure')
+
+        # Upload each selected image and keep the resulting Telegram IDs in the
+        # same order in which the user selected them.
+        tg_photo_ids = []
+        for image_number, image_bytes in enumerate(image_bytes_list, start=1):
+            with io.BytesIO(image_bytes) as img_buffer:
+                img_buffer.name = f"gallery_{actor_id}_{int(time.time())}_{image_number}.jpg"
+                # ✅ UPGRADE: पुराने मिक्स्ड 'BIN_CHANNEL' के बजाय पृथक 'ACTOR_STORAGE_CHANNEL' का उपयोग
+                msg = await temp.BOT.send_photo(chat_id=ACTOR_STORAGE_CHANNEL, photo=img_buffer)
+
+            if not msg or not msg.photo:
+                return web.HTTPFound(f'/actor/{actor_id}?err=Telegram Node Gallery Upload Failed ({image_number}/{len(image_bytes_list)})')
+            tg_photo_id = msg.photo.sizes[-1].file_id if hasattr(msg.photo, "sizes") and msg.photo.sizes else msg.photo.file_id
+            tg_photo_ids.append(f"TG_ID:{tg_photo_id}")
         
-        # ✅ UPGRADE: गैलरी री-अपलोड प्रोटेक्शन के लिए मोंगोडीबी में 'is_gallery_permanent: True' सेट किया गया
-        await actors.update_one({"_id": ObjectId(actor_id)}, {"$push": {"gallery": f"TG_ID:{tg_photo_id}"}, "$set": {"is_gallery_permanent": True}})
-        return web.HTTPFound(f'/actor/{actor_id}?msg=New portrait uploaded successfully to star gallery!')
+        # Add all uploaded images atomically so one multi-photo submission is
+        # stored as one ordered batch instead of overwriting earlier images.
+        await actors.update_one(
+            {"_id": ObjectId(actor_id)},
+            {"$push": {"gallery": {"$each": tg_photo_ids}}, "$set": {"is_gallery_permanent": True}}
+        )
+        return web.HTTPFound(f'/actor/{actor_id}?msg={len(tg_photo_ids)} portrait(s) uploaded successfully to star gallery!')
     except Exception as e: return web.HTTPFound(f'/actors?err=System core crash: {str(e)}')
 
 # ─────────────────────────────────────────────────────────
