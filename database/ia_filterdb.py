@@ -704,15 +704,31 @@ async def delete_actor_profile(actor_id):
         return False
 
 async def delete_gallery_image_by_index(actor_id, index: int):
-    """गैलरी एरे में से स्पेसिफिक इंडेक्स वाली इमेज को पुल (हटा) करता है।"""
+    """गैलरी एरे में से स्पेसिफिक इंडेक्स वाली इमेज हटाता है।
+
+    ✅ FIX: पहले यह index से value निकालकर `$pull: {gallery: value}` करता था —
+    Telegram identical photos को एक ही file_id देता है, इसलिए duplicate होने पर
+    एक delete में सारी copies उड़ जाती थीं (या semantics गलत हो जाते थे)।
+    अब index-based delete का सही atomic तरीका: पहले उस position को `$unset`
+    (null बन जाता है), फिर null entries को `$pull` — सिर्फ़ वही एक element हटता है।
+
+    साथ ही `gallery_updated_at` bump होता है ताकि frontend की versioned image
+    URLs (&v=) बदल जाएँ और browser का 1-साल वाला immutable cache bust हो जाए।
+    """
     try:
-        doc = await actors.find_one({"_id": ObjectId(actor_id)})
+        oid = ObjectId(actor_id)
+        doc = await actors.find_one({"_id": oid})
         if not doc or "gallery" not in doc: return False
         gallery = doc["gallery"]
         if index < 0 or index >= len(gallery): return False
-        target_tg_id = gallery[index]
-        res = await actors.update_one({"_id": ObjectId(actor_id)}, {"$pull": {"gallery": target_tg_id}})
-        return bool(res.modified_count)
+        res = await actors.update_one(
+            {"_id": oid},
+            {"$unset": {f"gallery.{index}": 1}, "$set": {"gallery_updated_at": int(time.time())}},
+        )
+        if not res.modified_count: return False
+        # $unset array element को null छोड़ता है — उसे निकालना ज़रूरी है
+        await actors.update_one({"_id": oid}, {"$pull": {"gallery": None}})
+        return True
     except Exception as e:
         logger.error(f"delete_gallery_image error: {e}")
         return False
