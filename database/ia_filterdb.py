@@ -167,6 +167,26 @@ async def get_post_category_counts():
             counts.get("Porn", 0))
 
 # ─────────────────────────────────────────────────────────
+# 📐 MEDIA META (resolution + container) — INDEX-TIME CAPTURE
+# ✅ width / height / mime_type Telegram se SIRF indexing ke waqt milte hain.
+# Inhe baad me nikaalne ke liye poora channel dobara scan karna padega
+# (flood-wait + ghante), isliye ye teen fields abhi hi save kar lete hain —
+# aage se "1080p only", "mkv only", aspect-ratio jaise filter isi se banenge.
+# Document par width/height hota hi nahi (getattr se safe) aur mime_type kabhi
+# None bhi ho sakta hai, isliye dono ke liye sane default (0 / "") rakhe hain.
+# ─────────────────────────────────────────────────────────
+META_SCHEMA_VERSION = 1  # future me meta ka shape badle to version bump ho jayega
+
+def build_media_meta(media):
+    """media object se {v, w, h, mime} dict banata hai (pure function — testable)."""
+    return {
+        "v": META_SCHEMA_VERSION,
+        "w": int(getattr(media, "width", 0) or 0),
+        "h": int(getattr(media, "height", 0) or 0),
+        "mime": str(getattr(media, "mime_type", None) or ""),
+    }
+
+# ─────────────────────────────────────────────────────────
 # 💾 SAVE FILE
 # ─────────────────────────────────────────────────────────
 async def save_file(media, collection_type="primary"):
@@ -188,13 +208,21 @@ async def save_file(media, collection_type="primary"):
         # hydrogram me Video/Animation/Audio par .duration hota hai, Document par nahi,
         # isliye getattr se safe rakha hai (documents ke liye 0 → UI me chip hide).
         duration = int(getattr(media, "duration", 0) or 0)
+        meta = build_media_meta(media)
 
+        # ✅ meta ko dotted keys ($set: {"meta.w": ...}) se likhna zaroori hai —
+        # agar poora "meta" sub-document ek $set me bhejte, to future me kisi
+        # naye meta field ke backfill ka data isi write se mit jaata.
         update_set = {
             "file_ref":  media.file_id,
             "file_name": f_name,
             "file_size": media.file_size,
             "file_type": file_type,
             "duration":  duration,
+            "meta.v":    meta["v"],
+            "meta.w":    meta["w"],
+            "meta.h":    meta["h"],
+            "meta.mime": meta["mime"],
         }
 
         update_payload = {"$set": update_set, "$setOnInsert": {"added_on": time.time()}}
@@ -230,9 +258,12 @@ def _build_regex(query: str):
 
 # ─────────────────────────────────────────────────────────
 # 📑 SHARED PROJECTION (पहले यह 7 जगह हुबहू टाइप किया गया था)
+# ✅ meta bhi projection me hai — web/search API ko resolution & container
+# chahiye hoti hai (filter/dropdown ke liye), aur yeh sirf ~40 bytes/doc ka hai.
 # ─────────────────────────────────────────────────────────
 FILE_PROJECTION = {"_id": 1, "file_name": 1, "file_size": 1, "file_type": 1,
-                   "file_ref": 1, "caption": 1, "thumb_url": 1, "duration": 1}
+                   "file_ref": 1, "caption": 1, "thumb_url": 1, "duration": 1,
+                   "meta": 1}
 FILE_PROJECTION_SCORED = {**FILE_PROJECTION, "score": {"$meta": "textScore"}}
 
 # ─────────────────────────────────────────────────────────

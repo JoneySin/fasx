@@ -814,6 +814,178 @@ class TestDurationBackfill(unittest.TestCase):
         asyncio.run(_backfill_duration(BoomCol(), "FID", {}, None))  # raise nahi karna chahiye
 
 
+class TestMediaMetaCapture(unittest.TestCase):
+    """Indexing ke waqt width/height/mime_type DB me save hone chahiye.
+
+    Ye teen fields Telegram se sirf index ke waqt milte hain — baad me nikaalne
+    ke liye poora channel dobara scan karna padta (flood + time).
+    """
+
+    def test_build_media_meta_from_video(self):
+        from database.ia_filterdb import build_media_meta
+
+        class FakeVideo:
+            width = 1920
+            height = 1080
+            mime_type = "video/mp4"
+
+        meta = build_media_meta(FakeVideo())
+        self.assertEqual(meta["w"], 1920)
+        self.assertEqual(meta["h"], 1080)
+        self.assertEqual(meta["mime"], "video/mp4")
+        self.assertEqual(meta["v"], 1)
+
+    def test_build_media_meta_document_has_no_dimensions(self):
+        """Document par width/height attribute hota hi nahi — crash nahi hona chahiye."""
+        from database.ia_filterdb import build_media_meta
+
+        class FakeDoc:
+            mime_type = "application/pdf"
+
+        meta = build_media_meta(FakeDoc())
+        self.assertEqual(meta["w"], 0)
+        self.assertEqual(meta["h"], 0)
+        self.assertEqual(meta["mime"], "application/pdf")
+
+    def test_build_media_meta_none_mime_becomes_empty_string(self):
+        from database.ia_filterdb import build_media_meta
+
+        class Weird:
+            width = 1280
+            height = 720
+            mime_type = None
+
+        meta = build_media_meta(Weird())
+        self.assertEqual(meta["mime"], "")
+        self.assertEqual((meta["w"], meta["h"]), (1280, 720))
+
+    def test_save_file_persists_meta_as_dotted_keys(self):
+        """meta dotted ($set: meta.w) se likhna chahiye taaki naya meta field
+        backfill karte waqt purane meta keys mit na jaayein."""
+        import asyncio
+        from unittest import mock
+        import database.ia_filterdb as fdb
+
+        class FakeVideo:
+            file_id = "CQADtest"
+            file_name = "Movie_2020_1080p.mkv"
+            caption = None
+            file_size = 12345
+            duration = 7260
+            width = 1920
+            height = 1080
+            mime_type = "video/x-matroska"
+
+        captured = {}
+
+        class FakeCol:
+            async def find_one(self, *a, **k): return None
+            async def update_one(self, flt, payload, **k): captured.update(payload)
+
+        with mock.patch.object(fdb, "unpack_new_file_id", return_value="ABC123"), \
+             mock.patch.object(fdb, "COLLECTIONS", {"primary": FakeCol()}):
+            result = asyncio.run(fdb.save_file(FakeVideo(), "primary"))
+
+        self.assertEqual(result, "suc")
+        self.assertEqual(captured["$set"]["meta.w"], 1920)
+        self.assertEqual(captured["$set"]["meta.h"], 1080)
+        self.assertEqual(captured["$set"]["meta.mime"], "video/x-matroska")
+        self.assertNotIn("meta", captured["$set"],
+                         "poora meta sub-document ek $set me nahi, dotted keys honi chahiye")
+
+    def test_save_file_document_meta_is_zero_not_missing(self):
+        import asyncio
+        from unittest import mock
+        import database.ia_filterdb as fdb
+
+        class FakeDoc:
+            file_id = "CQADtest"
+            file_name = "book.pdf"
+            caption = None
+            file_size = 999
+
+        captured = {}
+
+        class FakeCol:
+            async def find_one(self, *a, **k): return None
+            async def update_one(self, flt, payload, **k): captured.update(payload)
+
+        with mock.patch.object(fdb, "unpack_new_file_id", return_value="ABC999"), \
+             mock.patch.object(fdb, "COLLECTIONS", {"primary": FakeCol()}):
+            result = asyncio.run(fdb.save_file(FakeDoc(), "primary"))
+
+        self.assertEqual(result, "suc")
+        self.assertEqual(captured["$set"]["meta.w"], 0)
+        self.assertEqual(captured["$set"]["meta.h"], 0)
+        self.assertEqual(captured["$set"]["meta.mime"], "")
+
+    def test_projection_includes_meta(self):
+        from database.ia_filterdb import FILE_PROJECTION, FILE_PROJECTION_SCORED
+        self.assertEqual(FILE_PROJECTION.get("meta"), 1)
+        self.assertEqual(FILE_PROJECTION_SCORED.get("meta"), 1)
+
+
+class TestMediaMetaBackfill(unittest.TestCase):
+    """Purani files: thumbnail fetch ke waqt meta free me backfill hota hai."""
+
+    def _run(self, existing, width=1920, height=1080, mime="video/x-matroska", has_media=True):
+        import asyncio
+        from unittest import mock
+        from web.search_api import _backfill_media_meta
+
+        writes = []
+
+        class FakeCol:
+            async def update_one(self, flt, payload, **k): writes.append(payload)
+
+        # class body me `width = width` likhne se NameError aata hai (class-body
+        # name lookup enclosing function scope nahi karta), isliye attributes
+        # class banne ke baad set kiye jaate hain.
+        class FakeMedia:
+            pass
+
+        FakeMedia.width = width
+        FakeMedia.height = height
+        FakeMedia.mime_type = mime
+
+        msg = mock.MagicMock()
+        msg.media = mock.MagicMock()
+        msg.media.value = "video"
+        msg.video = FakeMedia() if has_media else None
+
+        asyncio.run(_backfill_media_meta(FakeCol(), "FID", existing, msg))
+        return writes
+
+    def test_backfills_when_missing(self):
+        writes = self._run({"_id": "FID"})
+        self.assertEqual(writes, [{"$set": {
+            "meta.v": 1, "meta.w": 1920, "meta.h": 1080, "meta.mime": "video/x-matroska"
+        }}])
+
+    def test_skips_when_already_present(self):
+        writes = self._run({"_id": "FID", "meta": {"v": 1, "w": 640, "h": 480, "mime": "video/mp4"}})
+        self.assertEqual(writes, [], "meta pehle se hai to dobara write nahi hona chahiye")
+
+    def test_skips_when_msg_has_nothing_useful(self):
+        """Document (na width/height, na mime) par likhne layak kuch nahi hai."""
+        writes = self._run({"_id": "FID"}, width=0, height=0, mime="")
+        self.assertEqual(writes, [])
+
+    def test_skips_when_msg_media_missing(self):
+        writes = self._run({"_id": "FID"}, has_media=False)
+        self.assertEqual(writes, [])
+
+    def test_never_raises(self):
+        """Thumbnail flow ko meta backfill ki wajah se kabhi fail nahi hona chahiye."""
+        import asyncio
+        from web.search_api import _backfill_media_meta
+
+        class BoomCol:
+            async def update_one(self, *a, **k): raise RuntimeError("db down")
+
+        asyncio.run(_backfill_media_meta(BoomCol(), "FID", {}, None))  # raise nahi karna chahiye
+
+
 class TestDurationOnlyOnWeb(unittest.TestCase):
     """User ne kaha 'sirf web per' — Telegram bot ke messages me duration nahi jaana chahiye."""
 

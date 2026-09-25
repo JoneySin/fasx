@@ -17,7 +17,7 @@ from utils import temp, get_size, is_premium, get_duration_str
 # ✅ SYNC: THUMBNAIL_STORAGE_CHANNEL को इम्पोर्ट किया गया है पृथक स्टोरेज के लिए
 from info import BIN_CHANNEL, ADMINS, BOT_TOKEN, MAX_WEB_RESULTS, MAX_THUMB_CACHE, IS_PREMIUM, THUMBNAIL_STORAGE_CHANNEL
 # यहाँ db_stats के लिए 'db as filter_db' ऐड किया गया है
-from database.ia_filterdb import COLLECTIONS, get_search_results, get_recent_files, db as filter_db, delete_single_file
+from database.ia_filterdb import COLLECTIONS, get_search_results, get_recent_files, db as filter_db, delete_single_file, build_media_meta
 from database.users_chats_db import db
 # ✅ SYNC FIX: cookie-session identity check अब यहाँ दोबारा नहीं लिखा, web_assets से reuse हो रहा है
 # ✅ DRY: fast_json भी अब web_assets से ही आता है (पहले search_api/actor_routes/
@@ -73,7 +73,10 @@ async def _get_or_fetch_thumb(fid, col_name="primary", is_retry=False):
 
             async def _fetch():
                 target_collection = COLLECTIONS.get(col_name, COLLECTIONS["primary"])
-                existing = await target_collection.find_one({"_id": fid}, {"thumb_url": 1, "duration": 1})
+                existing = await target_collection.find_one(
+                    {"_id": fid},
+                    {"thumb_url": 1, "duration": 1, "meta": 1}
+                )
 
                 if existing and existing.get("thumb_url", "").startswith("TG_ID:"):
                     saved_thumb_id = existing["thumb_url"].replace("TG_ID:", "")
@@ -96,6 +99,11 @@ async def _get_or_fetch_thumb(fid, col_name="primary", is_retry=False):
                         # isliye extra Telegram API call ya DB read nahi lagti. Sirf tab
                         # likhte hain jab doc me duration abhi maujood na ho.
                         await _backfill_duration(target_collection, fid, existing, msg)
+
+                        # ✅ NEW: usi free msg se width/height/mime_type bhi backfill
+                        # (meta) — ye fields sirf index ke waqt milte hain, isliye
+                        # purani files ke liye yahi ek-matra free mauka hai.
+                        await _backfill_media_meta(target_collection, fid, existing, msg)
 
                         if msg.video and msg.video.thumbs and len(msg.video.thumbs) > 0:
                             thumb_id = msg.video.thumbs[0].file_id
@@ -138,6 +146,34 @@ async def _get_or_fetch_thumb(fid, col_name="primary", is_retry=False):
 
 
 # ─────────────────────────────────────────────────────────
+# 📐 MEDIA META LAZY BACKFILL (purani files ke liye, bina extra API call)
+# ─────────────────────────────────────────────────────────
+def _msg_media(msg):
+    """msg se asli media object (video/document/...) nikalta hai; na ho to None."""
+    return getattr(msg, msg.media.value, None) if getattr(msg, "media", None) else None
+
+async def _backfill_media_meta(col, fid, existing, msg):
+    """Thumbnail msg se width/height/mime_type nikal ke meta me save karta hai (sirf missing ho to).
+
+    Duration backfill ki tarah hi free hai (msg waise bhi fetch hota hai) aur fail
+    hone par thumbnail flow ko bilkul nahi rokta. Purani (meta ke bina index huyi)
+    files par bhi chalta hai, isliye doc me meta pehle se hai to write skip.
+    """
+    try:
+        if existing and (existing.get("meta") or {}).get("w"):
+            return  # pehle se maujood hai, dobara likhne ki zaroorat nahi
+        media = _msg_media(msg)
+        if not media:
+            return
+        meta = build_media_meta(media)
+        if not (meta["w"] or meta["h"] or meta["mime"]):
+            return  # kuch bhi useful nahi mila (documents par width/height 0 hota hai)
+        await col.update_one({"_id": fid}, {"$set": {f"meta.{k}": v for k, v in meta.items()}})
+    except Exception as e:
+        logger.debug(f"Media meta backfill skipped for {fid}: {e}")
+
+
+# ─────────────────────────────────────────────────────────
 # ⏱️ DURATION LAZY BACKFILL (purani files ke liye, bina extra API call)
 # ─────────────────────────────────────────────────────────
 async def _backfill_duration(col, fid, existing, msg):
@@ -149,7 +185,7 @@ async def _backfill_duration(col, fid, existing, msg):
     try:
         if existing and existing.get("duration"):
             return  # pehle se maujood hai, dobara likhne ki zaroorat nahi
-        media = getattr(msg, msg.media.value, None) if getattr(msg, "media", None) else None
+        media = _msg_media(msg)
         duration = int(getattr(media, "duration", 0) or 0)
         if duration > 0:
             await col.update_one({"_id": fid}, {"$set": {"duration": duration}})
