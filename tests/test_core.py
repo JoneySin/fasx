@@ -1125,13 +1125,16 @@ class TestCommandListMatchesHandlers(unittest.TestCase):
 
 
 class TestResolutionLabel(unittest.TestCase):
-    """Poster/poster-text resolution chip ke liye label nikаlna."""
+    """Poster/poster-text resolution chip ke liye label nikаlna.
+
+    User ki requirement: 1280×720 ka "720p", 1920×1080 ka "1080p".
+    """
 
     def test_from_meta_height(self):
         from database.ia_filterdb import get_resolution_label
-        self.assertEqual(get_resolution_label(1080), "1080p")
-        self.assertEqual(get_resolution_label(2160), "4K")
-        self.assertEqual(get_resolution_label(720), "720p")
+        self.assertEqual(get_resolution_label(720), "720p")      # 1280×720
+        self.assertEqual(get_resolution_label(1080), "1080p")    # 1920×1080
+        self.assertEqual(get_resolution_label(2160), "4K")       # 3840×2160
         self.assertEqual(get_resolution_label(480), "480p")
         self.assertEqual(get_resolution_label(1440), "1440p")
 
@@ -1149,7 +1152,7 @@ class TestResolutionLabel(unittest.TestCase):
         self.assertEqual(get_resolution_label(0, ""), "")
         self.assertEqual(get_resolution_label(None), "")
 
-    def test_document_zero_height_no_false_positive(self):
+    def test_random_number_is_not_mistaken_for_resolution(self):
         """'1080' jaise random number par '1080p' nahi banna chahiye."""
         from database.ia_filterdb import get_resolution_label
         self.assertEqual(get_resolution_label(0, "Fast 1080 Movie"), "")
@@ -1161,106 +1164,6 @@ class TestResolutionLabel(unittest.TestCase):
         self.assertEqual(doc_resolution_label({}), "")
         self.assertEqual(doc_resolution_label({"meta": None, "file_name": "x"}), "")
         self.assertEqual(doc_resolution_label({"meta": {"h": 1080}}), "1080p")
-
-
-class TestQualityYearFilter(unittest.TestCase):
-    """Quality/year dropdown se mongo filter banta hai."""
-
-    def test_no_filter_gives_empty_dict(self):
-        from database.ia_filterdb import build_meta_filter
-        self.assertEqual(build_meta_filter(), {})
-        self.assertEqual(build_meta_filter("", ""), {})
-
-    def test_unknown_quality_ignored(self):
-        from database.ia_filterdb import build_meta_filter
-        self.assertEqual(build_meta_filter("8k_bluray_xxx"), {})
-        # unknown quality ke saath sahi year — sirf year clause bacha rehta hai
-        flt = build_meta_filter("8k_bluray_xxx", "2021")
-        self.assertEqual(list(flt.keys()), ["file_name"])
-
-    def test_quality_filter_has_height_range_and_name_pattern(self):
-        from database.ia_filterdb import build_meta_filter
-        flt = build_meta_filter("1080p")
-        self.assertIn("$or", flt)
-        self.assertEqual(flt["$or"][0], {"meta.h": {"$gte": 1000, "$lt": 2000}})
-        name_re = flt["$or"][1]["file_name"]
-        self.assertTrue(name_re.search("Movie 1080p x265"))
-        self.assertTrue(name_re.search("Movie FHD"))
-        self.assertFalse(name_re.search("Movie 720p"))
-
-    def test_4k_has_no_upper_bound(self):
-        from database.ia_filterdb import build_meta_filter
-        flt = build_meta_filter("4k")
-        self.assertEqual(flt["$or"][0], {"meta.h": {"$gte": 2000}})
-
-    def test_480p_starts_above_zero(self):
-        """h=0 (documents) ko 480p filter me nahi girना chahiye."""
-        from database.ia_filterdb import build_meta_filter
-        flt = build_meta_filter("480p")
-        self.assertEqual(flt["$or"][0], {"meta.h": {"$gte": 1, "$lt": 600}})
-
-    def test_year_filter_matches_whole_number_only(self):
-        from database.ia_filterdb import build_meta_filter
-        flt = build_meta_filter(None, "2021")
-        name_re = flt["file_name"]
-        self.assertTrue(name_re.search("Movie 2021 1080p"))
-        self.assertFalse(name_re.search("Movie 20210 1080p"))
-        self.assertFalse(name_re.search("Movie 12021"))
-
-    def test_invalid_year_ignored(self):
-        from database.ia_filterdb import build_meta_filter
-        self.assertEqual(build_meta_filter(None, "20"), {})
-        self.assertEqual(build_meta_filter(None, "abcd"), {})
-        self.assertEqual(build_meta_filter(None, ""), {})
-
-    def test_both_filters_together(self):
-        from database.ia_filterdb import build_meta_filter
-        flt = build_meta_filter("720p", "2019")
-        self.assertIn("$or", flt)
-        self.assertIn("file_name", flt)
-
-
-class TestFilterMerging(unittest.TestCase):
-    """quality/year filter text/regex query ke saath safely combine hona chahiye."""
-
-    def _flt(self, query, **kw):
-        from database.ia_filterdb import build_query_filter, _build_regex
-        regex = _build_regex(query or "")
-        return build_query_filter(query, regex, **kw)
-
-    def test_text_search_keeps_text_at_top_level(self):
-        """Filter ke saath bhi $text top-level hi rehna chahiye (textScore sort safe)."""
-        flt, is_text = self._flt("batman", quality="1080p")
-        self.assertTrue(is_text)
-        self.assertIn("$text", flt)
-        self.assertIn("$or", flt)
-        self.assertNotIn("$and", flt)
-
-    def test_regex_path_uses_and_when_or_collides(self):
-        """Regex-path ka base khud $or use karta hai (file_name+caption) — quality
-        ka $or uske saath top-level merge nahi ho sakta, isliye $and wrap."""
-        from database.ia_filterdb import build_query_filter, _build_regex
-        regex = _build_regex("batman")
-        flt, is_text = build_query_filter("", regex, quality="1080p")
-        self.assertFalse(is_text)
-        self.assertIn("$and", flt)
-        self.assertEqual(len(flt["$and"]), 2)
-
-    def test_empty_query_with_filter_only(self):
-        """Dashboard ka 'sirf filter' browse mode — query khali, filter lagi."""
-        flt, is_text = self._flt("", quality="4k")
-        self.assertFalse(is_text)
-        self.assertIn("$or", flt)
-
-    def test_empty_query_no_filter_returns_none(self):
-        flt, is_text = self._flt("")
-        self.assertIsNone(flt)
-
-    def test_year_with_lang_does_not_lose_either(self):
-        flt, is_text = self._flt("batman", lang="hindi", year="2021")
-        self.assertTrue(is_text)
-        self.assertIn("$and", flt)      # $text + lang
-        self.assertIn("file_name", flt)  # year top-level merge ho gaya
 
 
 class TestResInApiResponse(unittest.TestCase):
@@ -1289,48 +1192,8 @@ class TestResInApiResponse(unittest.TestCase):
         self.assertEqual(_build_results_list(docs, "tg")[0]["res"], "")
 
 
-class TestFilterUiWiring(unittest.TestCase):
-    """Dashboard/miniapp ke quality/year dropdown aur resolution chip sजil se wired hain.
-
-    Ye regression tests render-time bugs pakadte hain — jaise placeholder reh jaana
-    (`__YEAR_ITEMS__` literal text banke dropdown me dikh jaata tha) ya naya dropdown
-    jodte waqt generic toggleCdd/closeCdds loop me id bhool jaana.
-    """
-
-    def _dash_js(self):
-        import web.dashboard_routes as dash
-        from web.web_assets import FILTER_YEARS_JS
-        return (dash.JS_ENGINE
-                .replace("__LIMIT_PLACEHOLDER__", "21")
-                .replace("__DEFAULT_MEDIA_MODE__", "none")
-                .replace("__YEARS_PLACEHOLDER__", FILTER_YEARS_JS))
-
-    def test_dashboard_js_has_no_leftover_placeholder(self):
-        import re
-        js = self._dash_js()
-        self.assertEqual(re.findall(r"__[A-Z_]+__", js), [],
-                         "placeholder reh gaya — inject chain adhoora hai")
-
-    def test_dashboard_js_has_filter_state_and_handlers(self):
-        js = self._dash_js()
-        for token in ("curQy=''", "curYr=''", "function pickQy", "function pickYr",
-                      "function buildYearFilter", "qy='+encodeURIComponent(curQy)",
-                      "yr='+encodeURIComponent(curYr)", "resChip", "resText"):
-            self.assertIn(token, js)
-
-    def test_dashboard_zone_has_all_four_dropdowns(self):
-        import web.dashboard_routes as dash
-        zone = dash.SEARCH_ZONE
-        for token in ("cddColBtn", "cddModeBtn", "cddQyBtn", "cddYrBtn",
-                      "pickQy('1080p'", "pickYr(''", "toggleCdd('Yr')"):
-            self.assertIn(token, zone)
-
-    def test_year_list_covers_current_year(self):
-        from web.web_assets import FILTER_YEARS, FILTER_YEARS_JS
-        from datetime import date
-        self.assertIn(str(date.today().year), FILTER_YEARS)
-        self.assertTrue(FILTER_YEARS_JS.startswith("[20"))
-        self.assertGreaterEqual(len(FILTER_YEARS), 12)
+class TestResInWebUI(unittest.TestCase):
+    """Resolution chip dashboard + miniapp + actor-profile teeno me dikhna chahiye."""
 
     def test_shared_css_has_resolution_chip(self):
         import web.web_assets as wa
@@ -1338,21 +1201,41 @@ class TestFilterUiWiring(unittest.TestCase):
         self.assertIn(".res-chip", wa.CSS)
         self.assertIn(".tc-res", wa.CSS)
 
-    def test_miniapp_page_years_injected(self):
-        import asyncio
-        from web.search_api import miniapp_page
+    def test_dashboard_renders_res_chip(self):
+        import web.dashboard_routes as dash
+        self.assertIn("resChip", dash.JS_ENGINE)
+        self.assertIn("resText", dash.JS_ENGINE)
+        self.assertIn("durChip+resChip", dash.JS_ENGINE)
+        self.assertIn("durText+resText", dash.JS_ENGINE)
 
-        class FakeReq:
-            pass
+    def test_miniapp_renders_res_chip(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "web", "miniapp.html")
+        with open(path, encoding="utf-8") as f:
+            html = f.read()
+        self.assertIn('class="rc"', html)
+        self.assertIn('class="tr"', html)
+        self.assertIn("${dc}${rc}", html)
+        self.assertIn("${td}${tr}", html)
 
-        resp = asyncio.run(miniapp_page(FakeReq()))
-        body = resp.text if hasattr(resp, "text") else resp
-        self.assertIn("const FILTER_YEARS=[", body)
-        self.assertNotIn("__YEAR_ITEMS__", body,
-                         "static year placeholder reh gaya — dropdown me literal text dikhega")
-        self.assertNotIn("__YEARS_PLACEHOLDER__", body)
-        for token in ("curQy", "curYr", "function buildYearFilter", 'class="rc"', "cmYr"):
-            self.assertIn(token, body)
+    def test_actor_profile_renders_res_chip(self):
+        import inspect
+        import web.actor_routes as ar
+        src = inspect.getsource(ar)
+        self.assertIn('"res": doc_resolution_label(d)', src)
+        self.assertIn("+durC+resC+", src)
+        self.assertIn("+durT+resT+", src)
+
+    def test_no_filter_dropdowns_present_yet(self):
+        """Quality/year dropdowns jaan-boojhkar baad ke liye rakhe hain — abhi
+        inka koi UI/param mojood nahi hona chahiye."""
+        import web.dashboard_routes as dash
+        import web.search_api as sa
+        self.assertNotIn("curQy", dash.JS_ENGINE)
+        self.assertNotIn("pickQy", dash.SEARCH_ZONE)
+        self.assertNotIn("qy", sa.api_search.__code__.co_names)
+        from database.ia_filterdb import build_query_filter
+        self.assertNotIn("quality", build_query_filter.__code__.co_varnames)
 
 
 if __name__ == "__main__":

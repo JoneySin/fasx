@@ -17,14 +17,12 @@ from utils import temp, get_size, is_premium, get_duration_str
 # ✅ SYNC: THUMBNAIL_STORAGE_CHANNEL को इम्पोर्ट किया गया है पृथक स्टोरेज के लिए
 from info import BIN_CHANNEL, ADMINS, BOT_TOKEN, MAX_WEB_RESULTS, MAX_THUMB_CACHE, IS_PREMIUM, THUMBNAIL_STORAGE_CHANNEL
 # यहाँ db_stats के लिए 'db as filter_db' ऐड किया गया है
-from database.ia_filterdb import (COLLECTIONS, get_search_results, get_recent_files, db as filter_db,
-                                  delete_single_file, build_media_meta, build_meta_filter,
-                                  QUALITY_FILTERS, doc_resolution_label)
+from database.ia_filterdb import COLLECTIONS, get_search_results, get_recent_files, db as filter_db, delete_single_file, build_media_meta, doc_resolution_label
 from database.users_chats_db import db
 # ✅ SYNC FIX: cookie-session identity check अब यहाँ दोबारा नहीं लिखा, web_assets से reuse हो रहा है
 # ✅ DRY: fast_json भी अब web_assets से ही आता है (पहले search_api/actor_routes/
 # post_routes तीनों में इसकी अलग-अलग copy थी)।
-from web.web_assets import get_auth as web_get_auth, fast_json, DEFAULT_MEDIA_MODE, FILTER_YEARS_JS
+from web.web_assets import get_auth as web_get_auth, fast_json, DEFAULT_MEDIA_MODE
 
 logger = logging.getLogger(__name__)
 
@@ -198,17 +196,14 @@ async def _backfill_duration(col, fid, existing, msg):
 # ─────────────────────────────────────────────────────────
 # 🔄 BACKGROUND PRE-FETCH WORKER (Controlled Warmup Load)
 # ─────────────────────────────────────────────────────────
-async def bg_prefetch_worker(tg_id, q, col, mode, prefetch_offset, lim, quality=None, year=None):
+async def bg_prefetch_worker(tg_id, q, col, mode, prefetch_offset, lim):
     try:
-        # ✅ cache key me quality/year bhi jaana chahiye — warna ek user ka
-        # filtered prefetch doosre ke unfiltered result se serve ho jaata
-        cache_key = f"{tg_id}_{q}_{col}_{mode}_{quality}_{year}_{prefetch_offset}"
+        cache_key = f"{tg_id}_{q}_{col}_{mode}_{prefetch_offset}"
         if cache_key in PREFETCH_CACHE:
             return
 
         docs, next_off, _, _ = await get_search_results(
-            q, lim, offset=prefetch_offset, collection_type=col, bypass_count=True,
-            quality=quality, year=year
+            q, lim, offset=prefetch_offset, collection_type=col, bypass_count=True
         )
 
         if docs:
@@ -312,8 +307,9 @@ def _build_results_list(all_m, mode):
             # ✅ NEW: video duration (e.g. "1:02:03"). Purani/unindexed files me duration
             # 0 hota hai, tab khali string jaati hai aur UI me chip ban hi nahi.
             "duration": get_duration_str(d.get("duration")),
-            # ✅ NEW: resolution chip ("1080p"/"4K"). meta.h se, warna file_name se
-            # (purani files) — kuch pata na chale to khali, chip banta hi nahi.
+            # ✅ NEW: resolution chip (1280×720 → "720p", 1920×1080 → "1080p").
+            # meta.h se, warna file_name se (purani files) — kuch pata na chale to
+            # khali string, aur UI me chip ban hi nahi.
             "res": doc_resolution_label(d),
             "type": d.get("file_type", "document").upper(),
             "source": source_collection_name.capitalize(),
@@ -337,14 +333,6 @@ async def api_search(req):
     off = req.query.get("offset", "0")
     col = req.query.get("col", "all").lower()
     mode = req.query.get("mode", DEFAULT_MEDIA_MODE).lower()
-    # 🎚️ quality/year filter dropdowns (khali = koi filter nahi). Sirf known
-    # quality keys pass hote hain, warna unknown value DB query me na jaaye.
-    qy = req.query.get("qy", "").strip().lower()
-    if qy not in QUALITY_FILTERS:
-        qy = ""
-    yr = req.query.get("yr", "").strip()
-    if not (yr.isdigit() and len(yr) == 4):
-        yr = ""
 
     try:
         off = max(0, int(off))
@@ -356,12 +344,7 @@ async def api_search(req):
     # 🆕 कोई query नहीं दी गई — dashboard पर खाली स्क्रीन दिखाने की बजाय
     # सबसे नई अपलोड की गई फाइलें (Recently Added) दिखाओ
     if not q:
-        # filter lagā hua hai to recent files ko bhi filter karte hain, taaki
-        # "sirf filter" browse mode me unfiltered files na aa jaayein
-        extra_filter = build_meta_filter(qy, yr) or None
-        recent_docs, recent_next_offset = await get_recent_files(
-            lim, offset=off, collection_type=col, extra_filter=extra_filter
-        )
+        recent_docs, recent_next_offset = await get_recent_files(lim, offset=off, collection_type=col)
         results_list = _build_results_list(recent_docs, mode)
         has_more = bool(recent_next_offset)
         return web.json_response({
@@ -373,13 +356,13 @@ async def api_search(req):
         }, dumps=fast_json)
 
     if off == 0:
-        trend_key = f"{col}_{mode}_{qy}_{yr}_{q.lower()}"
+        trend_key = f"{col}_{mode}_{q.lower()}"
         now_ts = time.time()
         if trend_key in TRENDING_CACHE and TRENDING_CACHE[trend_key]["expiry"] > now_ts:
             cached = TRENDING_CACHE[trend_key]
             
             if cached["next_offset"]:
-                asyncio.create_task(bg_prefetch_worker(tg_id, q, col, mode, cached["next_offset"], lim, qy, yr))
+                asyncio.create_task(bg_prefetch_worker(tg_id, q, col, mode, cached["next_offset"], lim))
 
             return web.json_response({
                 "results": cached["results"],
@@ -388,7 +371,7 @@ async def api_search(req):
                 "is_admin": role == "admin"
             }, dumps=fast_json)
 
-    current_cache_key = f"{tg_id}_{q}_{col}_{mode}_{qy}_{yr}_{off}"
+    current_cache_key = f"{tg_id}_{q}_{col}_{mode}_{off}"
     all_m = []
     next_offset = ""
 
@@ -398,19 +381,18 @@ async def api_search(req):
 
     if not all_m:
         all_m, next_offset, _, _ = await get_search_results(
-            q, lim, offset=off, collection_type=col, bypass_count=True,
-            quality=qy, year=yr
+            q, lim, offset=off, collection_type=col, bypass_count=True
         )
 
     has_more = bool(next_offset)
 
     if has_more:
-        asyncio.create_task(bg_prefetch_worker(tg_id, q, col, mode, next_offset, lim, qy, yr))
+        asyncio.create_task(bg_prefetch_worker(tg_id, q, col, mode, next_offset, lim))
 
     results_list = _build_results_list(all_m, mode)
 
     if off == 0 and results_list:
-        trend_key = f"{col}_{mode}_{qy}_{yr}_{q.lower()}"
+        trend_key = f"{col}_{mode}_{q.lower()}"
         TRENDING_CACHE[trend_key] = {
             "results": results_list,
             "next_offset": next_offset,
@@ -692,6 +674,4 @@ async def miniapp_page(req):
     with open(html_path, "r", encoding="utf-8") as f:
         html_src = f.read()
     html_src = html_src.replace("__DEFAULT_MEDIA_MODE__", DEFAULT_MEDIA_MODE)
-    # 📅 year filter dropdown ki list (current year se 16 saal peeche)
-    html_src = html_src.replace("__YEARS_PLACEHOLDER__", FILTER_YEARS_JS)
     return web.Response(text=html_src, content_type="text/html", charset="utf-8")

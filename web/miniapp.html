@@ -29,8 +29,6 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--txt);min-
 @keyframes ssSpin{to{transform:rotate(360deg)}}
 
 /* filters / cdd */
-/* 📱 4 filters ek line me na aa sakein — 2-2 rows me wrap karo */
-@media(max-width:520px){.fi{flex-wrap:wrap}.cw{flex:1 1 44%}}
 .fi{display:flex;gap:8px;padding-bottom:16px;overflow:visible}
 .cw{flex:1;min-width:0;position:relative;user-select:none}
 .cb{width:100%;box-sizing:border-box;background:var(--bg3);color:var(--txt);border:1.5px solid var(--br);border-radius:999px;padding:8px 28px 8px 14px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;justify-content:flex-start;gap:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:border-color .15s,box-shadow .15s;position:relative}
@@ -88,10 +86,10 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--txt);min-
 .sc{background:rgba(0,0,0,.6);backdrop-filter:blur(8px);color:#e0e0e0;border-radius:5px;padding:2px 7px;font-size:10px;font-weight:600;border:1px solid rgba(255,255,255,.08)}
 /* ⏱️ video duration chips */
 .dc{background:rgba(0,0,0,.75);backdrop-filter:blur(8px);color:#fff;border-radius:5px;padding:2px 7px;font-size:10px;font-weight:700;letter-spacing:.3px;border:1px solid rgba(255,255,255,.14);font-variant-numeric:tabular-nums}
-/* 🖼️ resolution chip — duration chip jaisa hi (null-tolerant: khali to banta hi nahi) */
+/* 🖼️ resolution chip — 1280×720 → "720p", 1920×1080 → "1080p" (khali to banta hi nahi) */
 .rc{background:rgba(0,0,0,.75);backdrop-filter:blur(8px);color:#ffd166;border-radius:5px;padding:2px 7px;font-size:10px;font-weight:800;letter-spacing:.3px;border:1px solid rgba(255,209,102,.35)}
-.tr{color:#ffd166;font-size:11px;font-weight:800}
 .td{color:var(--mu);font-size:11px;font-weight:600;font-variant-numeric:tabular-nums}
+.tr{color:#ffd166;font-size:11px;font-weight:800}
 .sp{margin-left:auto;border-radius:20px;padding:2px 8px;font-size:9px;font-weight:700;letter-spacing:.4px;display:inline-flex;align-items:center;gap:4px}
 .sp.primary{background:#14532d;color:#4ade80;border:1px solid #22c55e}
 .sp.cloud{background:#1e3a5f;color:#93c5fd;border:1px solid #60a5fa}
@@ -196,22 +194,6 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--txt);min-
           <div class="ci" data-val="none" onclick="setCdd(this,'Mode','mode')">⚡ Fast (Text)<div class="cr"><div class="cd"></div></div></div>
         </div>
       </div>
-      <div class="cw" id="cwQy">
-        <div class="cb" id="cbQy" onclick="tCdd('Qy')"><span id="clQy">🎞️ All Quality</span><span class="ca">&#9660;</span></div>
-        <div class="cm" id="cmQy">
-          <div class="ci sel" data-val="" onclick="setCdd(this,'Qy','qy')">🎞️ All Quality<div class="cr"><div class="cd"></div></div></div>
-          <div class="ci" data-val="4k" onclick="setCdd(this,'Qy','qy')">✨ 4K / UHD<div class="cr"><div class="cd"></div></div></div>
-          <div class="ci" data-val="1080p" onclick="setCdd(this,'Qy','qy')">🟡 1080p FHD<div class="cr"><div class="cd"></div></div></div>
-          <div class="ci" data-val="720p" onclick="setCdd(this,'Qy','qy')">🔵 720p HD<div class="cr"><div class="cd"></div></div></div>
-          <div class="ci" data-val="480p" onclick="setCdd(this,'Qy','qy')">⚪ 480p SD<div class="cr"><div class="cd"></div></div></div>
-        </div>
-      </div>
-      <div class="cw" id="cwYr">
-        <div class="cb" id="cbYr" onclick="tCdd('Yr')"><span id="clYr">📅 Any Year</span><span class="ca">&#9660;</span></div>
-        <div class="cm" id="cmYr">
-          <div class="ci sel" data-val="" onclick="setCdd(this,'Yr','yr')">📅 Any Year<div class="cr"><div class="cd"></div></div></div>
-        </div>
-      </div>
     </div>
   </div>
   <div class="main">
@@ -258,10 +240,6 @@ const H={'X-Telegram-Init-Data':ID};
 let curQ='',curOff=0,nextOff='',curCol='all',curPage=1;
 let searchReqId=0;
 let pMode=localStorage.getItem('ff_mode')||'__DEFAULT_MEDIA_MODE__'; /* 🎛️ default injected from web_assets.DEFAULT_MEDIA_MODE */
-/* 🎚️ quality/year filter (khali = koi filter nahi) */
-let curQy='',curYr='';
-/* 📅 year dropdown items — server se inject (current year se 16 saal peeche) */
-const FILTER_YEARS=__YEARS_PLACEHOLDER__;
 let plyr=null,streamUrl='';
 
 
@@ -317,25 +295,12 @@ function setCdd(item,id,key){
   Q1('#cl'+id).textContent=lbl;
   Q1('#cm'+id).classList.remove('open');Q1('#cb'+id).classList.remove('open');
   if(key==='col'){curCol=val;doSearch(0,true);}
-  else if(key==='qy'){curQy=val;doSearch(0,true);}
-  else if(key==='yr'){curYr=val;doSearch(0,true);}
   else{
     pMode=val;localStorage.setItem('ff_mode',val);
     Q1('#results').classList.toggle('mn',val==='none');
     doSearch(curOff,true);
   }
 }
-/* 📅 year dropdown ko server-injected FILTER_YEARS se bharte hain */
-(function buildYearFilter(){
-  let box=Q1('#cmYr');if(!box||!window.FILTER_YEARS)return;
-  FILTER_YEARS.forEach(function(y){
-    let d=document.createElement('div');
-    d.className='ci';d.dataset.val=String(y);
-    d.innerHTML=y+'<div class="cr"><div class="cd"></div></div>';
-    d.onclick=function(){setCdd(d,'Yr','yr');};
-    box.appendChild(d);
-  });
-})();
 document.addEventListener('click',e=>{
   if(!e.target.closest('.cw')){Q('.cm').forEach(m=>m.classList.remove('open'));Q('.cb').forEach(b=>b.classList.remove('open'));}
 });
@@ -390,7 +355,7 @@ async function doSearch(off,allowEmpty){
   },150);
 
   try{
-    let r=await fetch(`/api/search?q=${encodeURIComponent(q)}&offset=${off}&col=${curCol}&mode=${pMode}&qy=${encodeURIComponent(curQy)}&yr=${encodeURIComponent(curYr)}`,{headers:H});
+    let r=await fetch(`/api/search?q=${encodeURIComponent(q)}&offset=${off}&col=${curCol}&mode=${pMode}`,{headers:H});
     if(myReq!==searchReqId){clearTimeout(loadTimer);qWrap.classList.remove('loading');return;}
     clearTimeout(loadTimer);
     qWrap.classList.remove('loading');
@@ -411,7 +376,7 @@ async function doSearch(off,allowEmpty){
          tab chip banta hi nahi, "0:00" jaisa bekaar text nahi dikhta. */
       let dc=f.duration?`<span class="dc">${esc(f.duration)}</span>`:'';
       let td=f.duration?`<span class="td">${esc(f.duration)}</span>`:'';
-      /* 🖼️ resolution chip — meta.h ya file_name se; khali to chip banta hi nahi */
+      /* 🖼️ resolution chip — 1280×720 → "720p", 1920×1080 → "1080p"; khali to nahi banta */
       let rc=f.res?`<span class="rc">${esc(f.res)}</span>`:'';
       let tr=f.res?`<span class="tr">${esc(f.res)}</span>`:'';
       let ph=pMode!=='none'

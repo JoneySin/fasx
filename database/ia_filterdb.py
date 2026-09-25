@@ -267,59 +267,14 @@ FILE_PROJECTION = {"_id": 1, "file_name": 1, "file_size": 1, "file_type": 1,
 FILE_PROJECTION_SCORED = {**FILE_PROJECTION, "score": {"$meta": "textScore"}}
 
 # ─────────────────────────────────────────────────────────
-# 🎚️ QUALITY / YEAR FILTER ENGINE (web dropdowns ke liye)
-# ✅ meta.w/h par akela bharosa theek nahi — purani (bina-meta index huyi) files
-# me meta hai hi nahi. Isliye quality filter meta.h range AUR file_name pattern
-# DONO par match karta hai ($or), taaki nayi + purani files दोनों filter me aayein.
-# Note: $text ke saath $or use karna allowed hai (restriction sirf $nor/$elemMatch
-# hai, aur jab $or ke ANDAR $text ho) — isliye ye filter text search ke saath bhi
-# safely combine hota hai.
-# ─────────────────────────────────────────────────────────
-# key: (label, min_height, max_height_exclusive, file_name pattern)
-QUALITY_FILTERS = {
-    "4k":    ("4K / UHD", 2000, None, r"(4k|2160p|uhd)"),
-    "1080p": ("1080p FHD", 1000, 2000, r"(1080p|fhd)"),
-    "720p":  ("720p HD", 600, 1000, r"(720p)"),
-    "480p":  ("480p SD", 1, 600, r"(480p|576p|540p|360p)"),
-}
-
-def build_meta_filter(quality=None, year=None):
-    """quality/year dropdown ke liye mongo filter clauses (khaali dict = koi filter nahi).
-
-    Do alag top-level keys deta hai — "$or" (quality) aur "file_name" (year) — taaki
-    caller inhe base query me top-level merge kar sake (implicit AND, aur $text ka
-    textScore sort bhi safe rahe).
-    """
-    out = {}
-
-    q_key = (quality or "").strip().lower()
-    if q_key in QUALITY_FILTERS:
-        _, min_h, max_h, pattern = QUALITY_FILTERS[q_key]
-        h_cond = {"$gte": min_h} if min_h is not None else {"$gt": 0}
-        if max_h is not None:
-            h_cond["$lt"] = max_h
-        out["$or"] = [
-            {"meta.h": h_cond},
-            {"file_name": re.compile(pattern, re.IGNORECASE)},
-        ]
-
-    y = str(year or "").strip()
-    if y.isdigit() and len(y) == 4:
-        # \b se "2021" sirf poore saal ke roop me match ho — "20210" jaise
-        # random numbers me nahi. (file_name me dots/dashes pehle hi space ho
-        # chuke hote hain, isliye "Movie.2021." bhi match ho jaata hai.)
-        out["file_name"] = re.compile(r"\b" + y + r"\b")
-
-    return out
-
-# ─────────────────────────────────────────────────────────
 # 🖼️ RESOLUTION LABEL (poster/poster-text chip ke liye)
+# 1280×720 → "720p", 1920×1080 → "1080p", 3840×2160 → "4K"
 # ─────────────────────────────────────────────────────────
 def get_resolution_label(height, file_name=""):
-    """'"1080p"' jaisa label — meta.h se (accurate), warna file_name se (purani files).
+    """height se '720p'/'1080p' jaisa label; meta na ho to file_name se guess.
 
     Kuch pata na chale to khaali string — UI me chip banta hi nahi (duration chip
-    jैसा ही null-tolerant behaviour).
+    jaise hi null-tolerant behaviour).
     """
     try:
         h = int(height or 0)
@@ -362,45 +317,21 @@ def _strict_text_query(raw_query: str) -> str:
     words = clean.split()
     return " ".join(f'"{w}"' for w in words)
 
-def _merge_meta_filter(base, quality=None, year=None):
-    """quality/year filter ko base query me jodta hai.
-
-    Pehle top-level merge try karte hain (sibling keys = implicit AND — $text ke
-    saath sabse safe, textScore sort bach jaata hai). Key clash hone par
-    (jaise regex-path ka $or, ya lang+year dono file_name) $and wrap — $text ko
-    $and me rakhna allowed hai ($nor/$elemMatch me nahi).
-    """
-    meta = build_meta_filter(quality, year)
-    if not meta:
-        return base
-    for key in meta:
-        if key in base:
-            return {"$and": [base, meta]}
-    merged = dict(base)
-    merged.update(meta)
-    return merged
-
-def build_query_filter(raw_query: str, regex, lang=None, quality=None, year=None):
+def build_query_filter(raw_query: str, regex, lang=None):
     """(mongo_filter, is_text_search) लौटाता है; कुछ भी match न बन पाए तो (None, False)"""
     strict_query = _strict_text_query(raw_query)
     if strict_query:
         flt = {"$text": {"$search": strict_query}}
         if lang:
             flt = {"$and": [flt, {"file_name": re.compile(lang, re.IGNORECASE)}]}
-        return _merge_meta_filter(flt, quality, year), True
+        return flt, True
 
     if regex:
         flt = ({"$or": [{"file_name": regex}, {"caption": regex}]}
                if USE_CAPTION_FILTER else {"file_name": regex})
         if lang:
             flt = {"$and": [flt, {"file_name": re.compile(lang, re.IGNORECASE)}]}
-        return _merge_meta_filter(flt, quality, year), False
-
-    # query khali hai, par quality/year filter hai (dashboard ka "sirf filter"
-    # browse mode) — tab sirf meta filter chalate hain
-    meta_only = build_meta_filter(quality, year)
-    if meta_only:
-        return meta_only, False
+        return flt, False
 
     return None, False
 
@@ -414,9 +345,8 @@ def _tag_docs(docs, col_name: str):
 # ─────────────────────────────────────────────────────────
 # 🚀 SMART SEARCH
 # ─────────────────────────────────────────────────────────
-async def _search(col, raw_query: str, regex, offset: int, limit: int, lang=None, bypass_count=False,
-                  quality=None, year=None):
-    flt, is_text = build_query_filter(raw_query, regex, lang, quality, year)
+async def _search(col, raw_query: str, regex, offset: int, limit: int, lang=None, bypass_count=False):
+    flt, is_text = build_query_filter(raw_query, regex, lang)
     if not flt:
         return [], 0
 
@@ -430,10 +360,8 @@ async def _search(col, raw_query: str, regex, offset: int, limit: int, lang=None
             _tag_docs(docs, col_name)
             count = 0 if bypass_count else await col.count_documents(flt)
             return docs, count
-        # text-search खाली आया तो नीचे regex fallback चलता है — quality/year filter
-        # fallback me bhi lagana zaroori hai, वरना filter चुपचाप गायब हो जाता
-        # (results filter ke bina aa jaate)
-        flt, is_text = build_query_filter("", regex, lang, quality, year)
+        # text-search खाली आया तो नीचे regex fallback चलता है
+        flt, is_text = build_query_filter("", regex, lang)
         if not flt:
             return [], 0
 
@@ -452,17 +380,14 @@ async def get_count(col, flt, bypass):
 # ─────────────────────────────────────────────────────────
 # 🌐 PUBLIC SEARCH API (NEW UPGRADE: CROSS-COLLECTION MERGE)
 # ─────────────────────────────────────────────────────────
-async def get_search_results(query, max_results, offset=0, lang=None, collection_type="primary",
-                             bypass_count=False, cached_counts=None, counts_out=None,
-                             quality=None, year=None):
-    if not query and not (quality or year):
-        return [], "", 0, collection_type
-    raw_query  = str(query or "").strip()
+async def get_search_results(query, max_results, offset=0, lang=None, collection_type="primary", bypass_count=False, cached_counts=None, counts_out=None):
+    if not query: return [], "", 0, collection_type
+    raw_query  = str(query).strip()
     regex      = _build_regex(raw_query)
 
     # ✅ DRY: पहले यहाँ query-cleaning दोबारा inline लिखी थी; अब वही shared
     # build_query_filter() इस्तेमाल होता है जो _search() भी use करता है।
-    flt, is_text = build_query_filter(raw_query, regex, lang, quality, year)
+    flt, is_text = build_query_filter(raw_query, regex, lang)
     if not flt:
         return [], "", 0, collection_type
 
@@ -525,8 +450,7 @@ async def get_search_results(query, max_results, offset=0, lang=None, collection
 
     else:
         col = COLLECTIONS.get(collection_type, primary)
-        results, total = await _search(col, raw_query, regex, offset, max_results, lang,
-                                       bypass_count=bypass_count, quality=quality, year=year)
+        results, total = await _search(col, raw_query, regex, offset, max_results, lang, bypass_count=bypass_count)
         actual_src = collection_type.capitalize()
         if not results: total = 0
         # ✅ FIX: single-collection टैब (primary/cloud/archive) के लिए भी counts_out भरो
@@ -651,17 +575,14 @@ async def get_db_spell_suggestions(query, limit=5, collection_type="all"):
 # 🆕 RECENT FILES (कोई query ना हो तब dashboard पर दिखाने के लिए
 # — सबसे नई अपलोड की गई फाइलें, ताकि पेज खाली ना लगे)
 # ─────────────────────────────────────────────────────────
-async def get_recent_files(max_results, offset=0, collection_type="all", extra_filter=None):
-    """Recently-added files. extra_filter diya to (quality/year dropdown ke bina
-    query wale browse mode) sirf un files ke saath, warna saari recent files."""
+async def get_recent_files(max_results, offset=0, collection_type="all"):
     proj = {**FILE_PROJECTION, "added_on": 1}
-    flt = extra_filter or {}
 
     if collection_type == "all":
         take = offset + max_results + 1  # +1 ताकि has_more पता चल सके
         merged = []
         for col in (primary, cloud, archive):
-            cursor = col.find(flt, proj).sort([('added_on', -1), ('_id', -1)]).limit(take)
+            cursor = col.find({}, proj).sort([('added_on', -1), ('_id', -1)]).limit(take)
             docs = await cursor.to_list(length=take)
             for doc in docs:
                 doc["file_id"] = doc["_id"]
@@ -675,7 +596,7 @@ async def get_recent_files(max_results, offset=0, collection_type="all", extra_f
         return page, next_offset
 
     col = COLLECTIONS.get(collection_type, primary)
-    cursor = col.find(flt, proj).sort([('added_on', -1), ('_id', -1)]).skip(offset).limit(max_results)
+    cursor = col.find({}, proj).sort([('added_on', -1), ('_id', -1)]).skip(offset).limit(max_results)
     docs = await cursor.to_list(length=max_results)
     for doc in docs:
         doc["file_id"] = doc["_id"]

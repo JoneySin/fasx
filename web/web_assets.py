@@ -1,6 +1,5 @@
 import time
 import orjson
-from datetime import datetime
 from aiohttp import web
 from info import ADMINS, MAX_WEB_RESULTS
 from utils import temp
@@ -25,16 +24,6 @@ def fast_json(data):
 # ─────────────────────────────────────────────
 DEFAULT_CATALOG_MODE = "text"
 DEFAULT_MEDIA_MODE = "none"
-
-# ─────────────────────────────────────────────
-# 📅 YEAR FILTER DROPDOWN SOURCE (dashboard + miniapp)
-# ✅ DRY: dashboard_routes.py के SEARCH_ZONE और miniapp.html — दोनों year
-# dropdown की list यहीं से inject होती है (`__YEARS_PLACEHOLDER__`)। List
-# current year se 16 saal peeche tak auto-banti rehti hai, isliye har saal
-# manually update karne ki zaroorat nahi.
-# ─────────────────────────────────────────────
-FILTER_YEARS = [str(y) for y in range(datetime.now().year, datetime.now().year - 16, -1)]
-FILTER_YEARS_JS = "[" + ",".join(FILTER_YEARS) + "]"
 
 # ─────────────────────────────────────────────
 # 🎨 SHARED DIRECTORY CSS
