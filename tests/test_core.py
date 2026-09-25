@@ -1138,6 +1138,21 @@ class TestResolutionLabel(unittest.TestCase):
         self.assertEqual(get_resolution_label(480), "480p")
         self.assertEqual(get_resolution_label(1440), "1440p")
 
+    def test_slightly_off_standard_still_snaps(self):
+        """±5% ke andar aane wale standard heights par bhi sahi label."""
+        from database.ia_filterdb import get_resolution_label
+        self.assertEqual(get_resolution_label(1072), "1080p")   # 99.3% of 1080
+        self.assertEqual(get_resolution_label(718), "720p")
+        self.assertEqual(get_resolution_label(2140), "4K")
+
+    def test_odd_resolution_shows_actual_height_not_fake_label(self):
+        """1245×655 jaisi non-standard file par '720p' jhooth nahi bolna chahiye."""
+        from database.ia_filterdb import get_resolution_label
+        self.assertEqual(get_resolution_label(655), "655p")
+        self.assertEqual(get_resolution_label(800), "800p")     # 720p se 11% door
+        self.assertEqual(get_resolution_label(536), "536p")     # cropped/screen-record
+        self.assertEqual(get_resolution_label(1918), "1918p")
+
     def test_unknown_height_falls_back_to_filename(self):
         from database.ia_filterdb import get_resolution_label
         # meta khali (purani file) — file_name se guess

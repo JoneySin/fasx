@@ -270,8 +270,27 @@ FILE_PROJECTION_SCORED = {**FILE_PROJECTION, "score": {"$meta": "textScore"}}
 # 🖼️ RESOLUTION LABEL (poster/poster-text chip ke liye)
 # 1280×720 → "720p", 1920×1080 → "1080p", 3840×2160 → "4K"
 # ─────────────────────────────────────────────────────────
+# standard heights + unka label. Ek-doosre se 20%+ door hain, isliye ±5%
+# tolerance ke baad bhi ranges overlap nahi karti.
+STD_RESOLUTIONS = (
+    (4320, "8K"),
+    (2160, "4K"),
+    (1440, "1440p"),
+    (1080, "1080p"),
+    (720,  "720p"),
+    (576,  "576p"),
+    (480,  "480p"),
+    (360,  "360p"),
+)
+_RES_TOLERANCE = 0.05  # standard height ka ±5% — us ke andar "snap" hota hai
+
 def get_resolution_label(height, file_name=""):
     """height se '720p'/'1080p' jaisa label; meta na ho to file_name se guess.
+
+    ⚠️ Pehle yahan coarse buckets the (h>=600 → "720p") — iski wajah se
+    1245×655 jaise odd-resolution file par bhi "720p" dikh jaata tha, jo jhooth
+    tha. Ab sirf tab standard label lagta hai jab height us ke ±5% ke andar ho;
+    warna asli height ("655p") — galat quality claim karne se behtar hai.
 
     Kuch pata na chale to khaali string — UI me chip banta hi nahi (duration chip
     jaise hi null-tolerant behaviour).
@@ -281,12 +300,11 @@ def get_resolution_label(height, file_name=""):
     except (TypeError, ValueError):
         h = 0
 
-    if h >= 2000: return "4K"
-    if h >= 1400: return "1440p"
-    if h >= 1000: return "1080p"
-    if h >= 600:  return "720p"
-    if h >= 400:  return "480p"
-    if h > 0:     return f"{h}p"   # anjaan height ko as-is dikha do
+    if h > 0:
+        for std, label in STD_RESOLUTIONS:
+            if abs(h - std) <= std * _RES_TOLERANCE:
+                return label
+        return f"{h}p"   # standard se door — asli height dikhao
 
     # meta khali (purani file) — file_name se guess karo
     if file_name:
