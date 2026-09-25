@@ -11,6 +11,7 @@ from utils import temp, get_readable_time
 from database.ia_filterdb import (FILE_COLLECTIONS, build_meta_migration_query,
                                   apply_media_meta_update, mark_meta_migration_error,
                                   msg_media, media_true_type)
+from media_probe import probe_telegram_file, should_probe_media
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ DELETE_BATCH = 100
 # 🎨 PROGRESS UI
 # ─────────────────────────────────────────────────────────
 def get_migration_ui(processed, total, filled, skipped, failed, elapsed, eta, speed,
-                     type_fixed=0, running=True):
+                     type_fixed=0, probed=0, running=True):
     percent = int((processed / max(total, 1)) * 100)
     dot = "🔴" if percent < 30 else ("🟡" if percent < 70 else "🟢")
     status = "▶️ Running" if running else "⏹ Stopped"
@@ -35,6 +36,7 @@ def get_migration_ui(processed, total, filled, skipped, failed, elapsed, eta, sp
         f"⏭️ <b>Skipped (no media)  :</b> <code>{skipped:,}</code>",
         f"❌ <b>Failed (broken ref) :</b> <code>{failed:,}</code>",
         f"🎬 <b>Type Fixed (doc→vid/aud):</b> <code>{type_fixed:,}</code>",
+        f"🔍 <b>Probed (real W×H) :</b> <code>{probed:,}</code>",
         f"⏱️ <b>Time Remaining :</b> <code>{get_readable_time(eta)}</code>",
         f"⚡ <b>Velocity       :</b> <code>{speed:.1f} f/min</code>",
         "──────────────────────────────",
@@ -67,13 +69,14 @@ async def start_meta_migration(client, status_msg, user_id):
 
     await status_msg.edit(
         f"📊 <b>Missing info detected:</b> <code>{total_to_process:,}</code> files\n"
-        f"Initializing single-bot safe stream pipeline...\n\n"
+        f"Initializing single-bot safe stream pipeline...\n"
+        f"🔍 <i>Asli resolution ab file bytes se probe hogi (Telegram ke attributes par bharosa nahi).</i>\n\n"
         f"<i>💡 Document likhi hui asli video/audio files ka type bhi theek ho jayega (mime_type se). Beech me bot restart ho jaaye to koi problem nahi — "
         f"jo files bhul chuki hain wo query se automatically hat jaati hain, "
         f"isi liye command dobara chalane se wahi se continue ho jayega.</i>"
     )
 
-    processed = filled = skipped = failed = type_fixed = 0
+    processed = filled = skipped = failed = type_fixed = probed_ok = 0
     start_time = time.time()
     pending_deletes = []   # BIN_CHANNEL ke temp messages (batch delete hote hain)
 
@@ -107,7 +110,7 @@ async def start_meta_migration(client, status_msg, user_id):
             cursor = collection.find(
                 query,
                 {"_id": 1, "file_ref": 1, "file_id": 1, "file_name": 1,
-                 "file_type": 1, "duration": 1, "meta": 1}
+                 "file_size": 1, "file_type": 1, "duration": 1, "meta": 1}
             ).sort("_id", 1)
 
             try:
@@ -119,7 +122,8 @@ async def start_meta_migration(client, status_msg, user_id):
                             + get_migration_ui(processed, total_to_process, filled,
                                                skipped, failed,
                                                time.time() - start_time, 0, 0,
-                                               type_fixed=type_fixed, running=False)
+                                               type_fixed=type_fixed, probed=probed_ok,
+                                               running=False)
                             + "\n\n<i>💡 Jitni files bhul chuki hain unme info save ho chuki hai — "
                               "command dobara chalane se baaki se continue hoga.</i>"
                         )
@@ -142,18 +146,55 @@ async def start_meta_migration(client, status_msg, user_id):
                         if not media:
                             skipped += 1
                         else:
+                            # 🔍 Asli resolution file BYTES se probe karo — Telegram
+                            # ke w/h attributes uploader ke likhe hote hain aur aksar
+                            # default (1280×720) hote hain, jabki file kuch aur ho.
+                            # Probe ke liye msg se mila FRESH file_id use hota hai
+                            # (DB wala file_ref purana ho sakta hai). Sirf video-ish
+                            # files par — PDF/MP3 par bandwidth waste nahi.
+                            probed = {}
+                            if should_probe_media(media, doc.get("file_name", "")):
+                                try:
+                                    fresh_ref = getattr(media, "file_id", None) or fid
+                                    probed = await probe_telegram_file(
+                                        client, fresh_ref,
+                                        file_size=doc.get("file_size", 0) or 0,
+                                        file_name=str(doc.get("file_name", "")),
+                                    )
+                                except FloodWait:
+                                    raise  # bahar wala anti-flood handler pakdega
+                                except Exception as e:
+                                    logger.debug(f"[META-MIGRATE] probe fail "
+                                                 f"({file_label}): {str(e)[:80]}")
+                                    probed = {}
+
                             # 🎬 document likha hai par asli me video/audio hai
                             # (mime_type se pata) — wo bhi isi write me theek hota hai
                             await apply_media_meta_update(
                                 collection, doc["_id"], media,
-                                current_type=doc.get("file_type"))
+                                current_type=doc.get("file_type"),
+                                probed=probed or None)
                             filled += 1
                             if media_true_type(media) != doc.get("file_type"):
                                 type_fixed += 1
                                 print(f"🎬 [TYPE FIXED] {doc.get('file_type')} → "
                                       f"{media_true_type(media)} "
                                       f"({processed}/{total_to_process}) ✅ {file_label}", flush=True)
-                            print(f"💾 [FILLED] ({processed}/{total_to_process}) ✅ {file_label}", flush=True)
+                            pw, ph = (probed.get("w") or 0), (probed.get("h") or 0)
+                            if pw and ph:
+                                probed_ok += 1
+                                mw = int(getattr(media, "width", 0) or 0)
+                                mh = int(getattr(media, "height", 0) or 0)
+                                if (mw, mh) != (pw, ph):
+                                    print(f"🔍 [PROBED] {file_label}: TG {mw}x{mh} → "
+                                          f"real {pw}x{ph} ({processed}/{total_to_process})",
+                                          flush=True)
+                                else:
+                                    print(f"💾 [FILLED] ({processed}/{total_to_process}) ✅ "
+                                          f"{file_label} (probe confirmed {pw}x{ph})", flush=True)
+                            else:
+                                print(f"💾 [FILLED] ({processed}/{total_to_process}) ✅ {file_label}",
+                                      flush=True)
 
                         if msg:
                             pending_deletes.append(msg.id)
@@ -205,7 +246,7 @@ async def start_meta_migration(client, status_msg, user_id):
                             await status_msg.edit(
                                 get_migration_ui(processed, total_to_process, filled,
                                                  skipped, failed, elapsed, eta, speed,
-                                                 type_fixed=type_fixed)
+                                                 type_fixed=type_fixed, probed=probed_ok)
                             )
                         except MessageNotModified:
                             pass
@@ -230,6 +271,7 @@ async def start_meta_migration(client, status_msg, user_id):
         f"⏭️ <b>Skipped (no media) :</b> <code>{skipped:,}</code>\n"
         f"❌ <b>Failed (broken ref):</b> <code>{failed:,}</code>\n"
         f"🎬 <b>Type Fixed (doc→video/audio):</b> <code>{type_fixed:,}</code>\n"
+        f"🔍 <b>Probed Real Reso.  :</b> <code>{probed_ok:,}</code> Files\n"
         f"🕐 <b>Total Time         :</b> <code>{get_readable_time(total_elapsed)}</code>\n\n"
         f"⚡ <i>Dashboard, Mini App aur actor profiles par ab asli duration, "
         f"resolution (W×H) aur mime_type dikhega!</i>"
@@ -249,6 +291,7 @@ async def start_meta_migration(client, status_msg, user_id):
                 f"» Skipped: <code>{skipped:,}</code>\n"
                 f"» Failed: <code>{failed:,}</code>\n"
                 f"» Type Fixed: <code>{type_fixed:,}</code>\n"
+                f"» Probed Real Reso.: <code>{probed_ok:,}</code>\n"
                 f"» Time: <code>{get_readable_time(total_elapsed)}</code>"
             )
         except Exception:

@@ -18,6 +18,7 @@ from utils import temp, get_size, is_premium, get_duration_str
 from info import BIN_CHANNEL, ADMINS, BOT_TOKEN, MAX_WEB_RESULTS, MAX_THUMB_CACHE, IS_PREMIUM, THUMBNAIL_STORAGE_CHANNEL
 # यहाँ db_stats के लिए 'db as filter_db' ऐड किया गया है
 from database.ia_filterdb import COLLECTIONS, get_search_results, get_recent_files, db as filter_db, delete_single_file, build_media_meta, doc_resolution_text, msg_media
+from media_probe import probe_telegram_file, should_probe_media
 from database.users_chats_db import db
 # ✅ SYNC FIX: cookie-session identity check अब यहाँ दोबारा नहीं लिखा, web_assets से reuse हो रहा है
 # ✅ DRY: fast_json भी अब web_assets से ही आता है (पहले search_api/actor_routes/
@@ -75,7 +76,8 @@ async def _get_or_fetch_thumb(fid, col_name="primary", is_retry=False):
                 target_collection = COLLECTIONS.get(col_name, COLLECTIONS["primary"])
                 existing = await target_collection.find_one(
                     {"_id": fid},
-                    {"thumb_url": 1, "duration": 1, "meta": 1}
+                    {"thumb_url": 1, "duration": 1, "meta": 1,
+                     "file_ref": 1, "file_size": 1, "file_name": 1}
                 )
 
                 if existing and existing.get("thumb_url", "").startswith("TG_ID:"):
@@ -154,6 +156,13 @@ async def _backfill_media_meta(col, fid, existing, msg):
     Duration backfill ki tarah hi free hai (msg waise bhi fetch hota hai) aur fail
     hone par thumbnail flow ko bilkul nahi rokta. Purani (meta ke bina index huyi)
     files par bhi chalta hai, isliye doc me meta pehle se hai to write skip.
+
+    🔍 Video-ish file ho to asli dims file BYTES se probe hote hain (Telegram ke
+    attributes uploader ke likhe hote hain — 1280×720 default wala bug). Probe
+    fail ho to attributes likhte hain par `meta.v` NAHI (taaki /migrate_meta ise
+    dobara uthakar probe kar sake; migration hamesha v likhta hai, isliye koi
+    infinite loop nahi). Probed duration ground-truth hai — attr wali ko correct
+    bhi karta hai.
     """
     try:
         if existing and (existing.get("meta") or {}).get("w"):
@@ -161,10 +170,35 @@ async def _backfill_media_meta(col, fid, existing, msg):
         media = msg_media(msg)
         if not media:
             return
-        meta = build_media_meta(media)
+        existing = existing or {}
+        probed = {}
+        needs_probe = should_probe_media(media, existing.get("file_name", ""))
+        if needs_probe:
+            try:
+                fresh_ref = getattr(media, "file_id", None) or existing.get("file_ref")
+                if fresh_ref:
+                    probed = await probe_telegram_file(
+                        temp.BOT, fresh_ref,
+                        file_size=existing.get("file_size", 0) or 0,
+                        file_name=str(existing.get("file_name", "")),
+                    )
+            except Exception:
+                probed = {}
+        meta = build_media_meta(media, probed or None)
         if not (meta["w"] or meta["h"] or meta["mime"]):
             return  # kuch bhi useful nahi mila (documents par width/height 0 hota hai)
-        await col.update_one({"_id": fid}, {"$set": {f"meta.{k}": v for k, v in meta.items()}})
+        set_payload = {f"meta.{k}": v for k, v in meta.items()}
+        if needs_probe and not (probed.get("w") and probed.get("h")):
+            # probe nahi ho paya → v mat likho, migration retry karega
+            set_payload.pop("meta.v", None)
+        else:
+            try:
+                pdur = int((probed or {}).get("duration") or 0)
+            except (TypeError, ValueError):
+                pdur = 0
+            if pdur > 0:
+                set_payload["duration"] = pdur
+        await col.update_one({"_id": fid}, {"$set": set_payload})
     except Exception as e:
         logger.debug(f"Media meta backfill skipped for {fid}: {e}")
 
