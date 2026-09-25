@@ -1,6 +1,6 @@
 import time
 from aiohttp import web
-from web.web_assets import build_page, get_auth, form_wrapper, MAX_WEB_RESULTS, require_active_plan, DEFAULT_MEDIA_MODE
+from web.web_assets import build_page, get_auth, form_wrapper, MAX_WEB_RESULTS, require_active_plan, DEFAULT_MEDIA_MODE, FILTER_YEARS_JS
 from utils import temp
 
 dashboard_routes = web.RouteTableDef()
@@ -15,9 +15,11 @@ CARD_CSS = """
 .search-row1{display:flex;align-items:center;gap:10px;margin-bottom:10px}
 .search-row2{display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:16px}
 @media(min-width:768px){
-  .search-zone{padding:24px 24px 10px;display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:nowrap}
-  .search-row1{flex:1;max-width:650px;margin-bottom:0}
-  .search-row2{margin-bottom:0;justify-content:flex-start;flex-shrink:0}
+  .search-zone{padding:24px 24px 10px;display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap}
+  .search-row1{flex:1;max-width:650px;min-width:260px;margin-bottom:0}
+  /* ✅ 4 dropdowns (col/mode/quality/year) aa gaye hain — chhoti desktop width par
+     row ko wrap karne dena chahiye, warna search-box itna squeeze hota hai ki usable nahi rehta */
+  .search-row2{margin-bottom:0;justify-content:center;flex-wrap:wrap;flex-shrink:1;gap:8px}
 }
 
 .search-wrap{flex:1;min-width:0;display:flex;align-items:center;background:var(--bg3);border:1.5px solid var(--border);border-radius:12px;padding:0 6px 0 18px;gap:8px;overflow:hidden;min-height:38px;transition:border-color .18s}
@@ -78,48 +80,71 @@ var curQ='',curOff=0,nextOff='',curCol='all',curPage=1;
 var searchReqId=0;
 var pMode=localStorage.getItem('posterMode')||'__DEFAULT_MEDIA_MODE__';
 var LIMIT_VAL = __LIMIT_PLACEHOLDER__;
+/* 🎚️ quality/year filter (khali = koi filter nahi) */
+var curQy='',curYr='';
+/* 📅 year dropdown items — server se inject (current year se 16 saal peeche) */
+var FILTER_YEARS = __YEARS_PLACEHOLDER__;
 
+/* ✅ 4 dropdowns (Col/Mode/Qy/Yr) ke liye generic open-close logic — pehle sirf
+   col/mode the aur unke liye ternary chain likhi thi; naya filter jodne pe woh
+   chain 3 jagah badalni padti. Ab ek hi loop sab sambhalta hai. */
 function closeCdds(){
-    document.getElementById('cddColMenu').style.display='none';
-    document.getElementById('cddColBtn').classList.remove('open');
-    document.getElementById('cddModeMenu').style.display='none';
-    document.getElementById('cddModeBtn').classList.remove('open');
+    ['Col','Mode','Qy','Yr'].forEach(function(n){
+        var m=document.getElementById('cdd'+n+'Menu'),b=document.getElementById('cdd'+n+'Btn');
+        if(m)m.style.display='none';
+        if(b)b.classList.remove('open');
+    });
 }
 function toggleCdd(which,e){
     if(e){e.stopPropagation();}
-    var menuId=which==='col'?'cddColMenu':'cddModeMenu';
-    var btnId=which==='col'?'cddColBtn':'cddModeBtn';
-    var otherId=which==='col'?'cddModeMenu':'cddColMenu';
-    var otherBtnId=which==='col'?'cddModeBtn':'cddColBtn';
-    var menu=document.getElementById(menuId);
-    var btn=document.getElementById(btnId);
+    var menu=document.getElementById('cdd'+which+'Menu');
+    var btn=document.getElementById('cdd'+which+'Btn');
     var isOpen=menu.style.display!=='none';
-    document.getElementById(otherId).style.display='none';
-    document.getElementById(otherBtnId).classList.remove('open');
+    closeCdds();
     if(isOpen){menu.style.display='none';btn.classList.remove('open');}
     else{menu.style.display='block';btn.classList.add('open');}
 }
-function pickCol(val,label,el,e){
+function _pickCdd(which,label,el,e){
     if(e){e.stopPropagation();}
-    curCol=val;
-    document.getElementById('cddColLabel').textContent=label;
-    document.querySelectorAll('#cddColMenu .cdd-item').forEach(function(i){i.classList.remove('selected');});
+    document.getElementById('cdd'+which+'Label').textContent=label;
+    document.querySelectorAll('#cdd'+which+'Menu .cdd-item').forEach(function(i){i.classList.remove('selected');});
     el.classList.add('selected');
-    document.getElementById('cddColMenu').style.display='none';
-    document.getElementById('cddColBtn').classList.remove('open');
+    closeCdds();
+}
+function pickCol(val,label,el,e){
+    _pickCdd('Col',label,el,e);
+    curCol=val;
     doSearch(0,true);
 }
 function pickMode(val,label,el,e){
-    if(e){e.stopPropagation();}
+    _pickCdd('Mode',label,el,e);
     pMode=val;
     localStorage.setItem('posterMode',pMode);
-    document.getElementById('cddModeLabel').textContent=label;
-    document.querySelectorAll('#cddModeMenu .cdd-item').forEach(function(i){i.classList.remove('selected');});
-    el.classList.add('selected');
-    document.getElementById('cddModeMenu').style.display='none';
-    document.getElementById('cddModeBtn').classList.remove('open');
     doSearch(curOff,true);
 }
+function pickQy(val,label,el,e){
+    _pickCdd('Qy',label,el,e);
+    curQy=val;
+    doSearch(0,true);
+}
+function pickYr(val,label,el,e){
+    _pickCdd('Yr',label,el,e);
+    curYr=val;
+    doSearch(0,true);
+}
+/* 📅 year dropdown ko server-injected FILTER_YEARS se bharte hain */
+(function buildYearFilter(){
+    var menu=document.getElementById('cddYrMenu');
+    if(!menu||!window.FILTER_YEARS)return;
+    FILTER_YEARS.forEach(function(y){
+        var item=document.createElement('div');
+        item.className='cdd-item';
+        item.dataset.val=String(y);
+        item.innerHTML=y+'<span class="cdd-radio"><span class="cdd-radio-dot"></span></span>';
+        item.onclick=function(){pickYr(String(y),y,item);};
+        menu.appendChild(item);
+    });
+})();
 document.addEventListener('click',function(e){
     if(!e.target.closest('.cdd-wrap')){closeCdds();}
 });
@@ -152,7 +177,7 @@ async function doSearch(o,allowEmpty){
     },150);
 
     try{
-        var r=await fetch('/api/search?q='+encodeURIComponent(q)+'&offset='+o+'&col='+curCol+'&mode='+pMode);
+        var r=await fetch('/api/search?q='+encodeURIComponent(q)+'&offset='+o+'&col='+curCol+'&mode='+pMode+'&qy='+encodeURIComponent(curQy)+'&yr='+encodeURIComponent(curYr));
         if(myReq!==searchReqId){clearTimeout(loadTimer);if(qWrap)qWrap.classList.remove('loading');return;}
         clearTimeout(loadTimer);
         if(qWrap)qWrap.classList.remove('loading');
@@ -196,6 +221,9 @@ async function doSearch(o,allowEmpty){
                tab chip banta hi nahi — "0:00" jaisa bekaar text nahi dikhta. */
             var durChip  = f.duration ? '<span class="dur-chip">'+f.duration+'</span>' : '';
             var durText  = f.duration ? '<span class="tc-dur">'+f.duration+'</span>' : '';
+            /* 🖼️ Resolution chip — duration chip jaisa hi null-tolerant (khali = no chip) */
+            var resChip  = f.res ? '<span class="res-chip">'+f.res+'</span>' : '';
+            var resText  = f.res ? '<span class="tc-res">'+f.res+'</span>' : '';
 
             var posterHtml='';
             if(pMode!=='none'){
@@ -204,7 +232,7 @@ async function doSearch(o,allowEmpty){
                     '<div class="poster-top">'+
                         '<span class="type-chip">'+f.type.toUpperCase()+'</span>'+
                         '<span class="size-chip">'+f.size+'</span>'+
-                        durChip+
+                        durChip+resChip+
                         '<span class="source-pill '+sc+'"><span class="source-dot"></span>'+sc.toUpperCase()+'</span>'+
                     '</div>'+
                     adminBtns+
@@ -216,7 +244,7 @@ async function doSearch(o,allowEmpty){
                 textInfo='<div class="fc-text-info" onclick="toggleAdminBtns(this.closest(\\'.file-card\\'),event)">'+
                     '<span class="tc-type">'+f.type.toUpperCase()+'</span>'+
                     '<span class="tc-size">'+f.size+'</span>'+
-                    durText+
+                    durText+resText+
                     '<span class="source-pill '+sc+'" style="margin-left:auto"><span class="source-dot"></span>'+sc.toUpperCase()+'</span>'+
                 '</div>';
                 if(d.is_admin){
@@ -245,7 +273,7 @@ async function doSearch(o,allowEmpty){
         document.getElementById('pgInfo').textContent='Page '+curPage;
 
         if(nextOff) {
-            fetch('/api/search?q='+encodeURIComponent(q)+'&offset='+nextOff+'&col='+curCol+'&mode='+pMode);
+            fetch('/api/search?q='+encodeURIComponent(q)+'&offset='+nextOff+'&col='+curCol+'&mode='+pMode+'&qy='+encodeURIComponent(curQy)+'&yr='+encodeURIComponent(curYr));
         }
     }catch(e){clearTimeout(loadTimer);if(qWrap)qWrap.classList.remove('loading');showToast('Network error','error');}
 }
@@ -279,7 +307,7 @@ document.addEventListener('DOMContentLoaded',function(){
     var savedQ=sessionStorage.getItem('ff_dash_q');
     if(savedQ && q){q.value=savedQ;doSearch(0);}else{doSearch(0,true);}
 });
-""".replace("__LIMIT_PLACEHOLDER__", str(MAX_WEB_RESULTS)).replace("__DEFAULT_MEDIA_MODE__", DEFAULT_MEDIA_MODE)
+""".replace("__LIMIT_PLACEHOLDER__", str(MAX_WEB_RESULTS)).replace("__DEFAULT_MEDIA_MODE__", DEFAULT_MEDIA_MODE).replace("__YEARS_PLACEHOLDER__", FILTER_YEARS_JS)
 
 # 🎛️ Default mode dropdown state (centralized via DEFAULT_MEDIA_MODE in web_assets.py)
 _MODE_TG_LBL = '\U0001f4f8 Original TG Thumb'
@@ -301,7 +329,7 @@ SEARCH_ZONE = (
         '</div>'
         '<div class="search-row2">'
             '<div class="cdd-wrap" id="cddColWrap">'
-                '<div class="cdd-btn" id="cddColBtn" onclick="toggleCdd(\'col\')">'
+                '<div class="cdd-btn" id="cddColBtn" onclick="toggleCdd(\'Col\')">'
                     '<span id="cddColLabel">\U0001f4c2 All Collections</span>'
                 '</div>'
                 '<span class="cdd-arrow">&#9660;</span>'
@@ -313,13 +341,35 @@ SEARCH_ZONE = (
                 '</div>'
             '</div>'
             '<div class="cdd-wrap" id="cddModeWrap">'
-                '<div class="cdd-btn" id="cddModeBtn" onclick="toggleCdd(\'mode\')">'
+                '<div class="cdd-btn" id="cddModeBtn" onclick="toggleCdd(\'Mode\')">'
                     '<span id="cddModeLabel">' + _DEF_MODE_LBL + '</span>'
                 '</div>'
                 '<span class="cdd-arrow">&#9660;</span>'
                 '<div class="cdd-menu" id="cddModeMenu" style="display:none">'
                     '<div class="cdd-item' + _SEL_TG + '" data-val="tg" onclick="pickMode(\'tg\',\'\U0001f4f8 Original TG Thumb\',this)">\U0001f4f8 Original TG Thumb<span class="cdd-radio"><span class="cdd-radio-dot"></span></span></div>'
                     '<div class="cdd-item' + _SEL_NONE + '" data-val="none" onclick="pickMode(\'none\',\'\u26a1 Text Only (Fastest)\',this)">\u26a1 Text Only (Fastest)<span class="cdd-radio"><span class="cdd-radio-dot"></span></span></div>'
+                '</div>'
+            '</div>'
+            '<div class="cdd-wrap" id="cddQyWrap">'
+                '<div class="cdd-btn" id="cddQyBtn" onclick="toggleCdd(\'Qy\')">'
+                    '<span id="cddQyLabel">\U0001f39e All Quality</span>'
+                '</div>'
+                '<span class="cdd-arrow">&#9660;</span>'
+                '<div class="cdd-menu" id="cddQyMenu" style="display:none">'
+                    '<div class="cdd-item selected" data-val="" onclick="pickQy(\'\',\'\U0001f39e All Quality\',this)">\U0001f39e All Quality<span class="cdd-radio"><span class="cdd-radio-dot"></span></span></div>'
+                    '<div class="cdd-item" data-val="4k" onclick="pickQy(\'4k\',\'✨ 4K / UHD\',this)">✨ 4K / UHD<span class="cdd-radio"><span class="cdd-radio-dot"></span></span></div>'
+                    '<div class="cdd-item" data-val="1080p" onclick="pickQy(\'1080p\',\'🟡 1080p FHD\',this)">🟡 1080p FHD<span class="cdd-radio"><span class="cdd-radio-dot"></span></span></div>'
+                    '<div class="cdd-item" data-val="720p" onclick="pickQy(\'720p\',\'🔵 720p HD\',this)">🔵 720p HD<span class="cdd-radio"><span class="cdd-radio-dot"></span></span></div>'
+                    '<div class="cdd-item" data-val="480p" onclick="pickQy(\'480p\',\'⚪ 480p SD\',this)">⚪ 480p SD<span class="cdd-radio"><span class="cdd-radio-dot"></span></span></div>'
+                '</div>'
+            '</div>'
+            '<div class="cdd-wrap" id="cddYrWrap">'
+                '<div class="cdd-btn" id="cddYrBtn" onclick="toggleCdd(\'Yr\')">'
+                    '<span id="cddYrLabel">\U0001f4c5 Any Year</span>'
+                '</div>'
+                '<span class="cdd-arrow">&#9660;</span>'
+                '<div class="cdd-menu" id="cddYrMenu" style="display:none">'
+                    '<div class="cdd-item selected" data-val="" onclick="pickYr(\'\',\'\U0001f4c5 Any Year\',this)">\U0001f4c5 Any Year<span class="cdd-radio"><span class="cdd-radio-dot"></span></span></div>'
                 '</div>'
             '</div>'
         '</div>'
