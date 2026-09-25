@@ -17,7 +17,7 @@ from utils import temp, get_size, is_premium, get_duration_str
 # ✅ SYNC: THUMBNAIL_STORAGE_CHANNEL को इम्पोर्ट किया गया है पृथक स्टोरेज के लिए
 from info import BIN_CHANNEL, ADMINS, BOT_TOKEN, MAX_WEB_RESULTS, MAX_THUMB_CACHE, IS_PREMIUM, THUMBNAIL_STORAGE_CHANNEL
 # यहाँ db_stats के लिए 'db as filter_db' ऐड किया गया है
-from database.ia_filterdb import COLLECTIONS, get_search_results, get_recent_files, db as filter_db, delete_single_file, build_media_meta, doc_resolution_label
+from database.ia_filterdb import COLLECTIONS, get_search_results, get_recent_files, db as filter_db, delete_single_file, build_media_meta, doc_resolution_text, msg_media
 from database.users_chats_db import db
 # ✅ SYNC FIX: cookie-session identity check अब यहाँ दोबारा नहीं लिखा, web_assets से reuse हो रहा है
 # ✅ DRY: fast_json भी अब web_assets से ही आता है (पहले search_api/actor_routes/
@@ -148,10 +148,6 @@ async def _get_or_fetch_thumb(fid, col_name="primary", is_retry=False):
 # ─────────────────────────────────────────────────────────
 # 📐 MEDIA META LAZY BACKFILL (purani files ke liye, bina extra API call)
 # ─────────────────────────────────────────────────────────
-def _msg_media(msg):
-    """msg se asli media object (video/document/...) nikalta hai; na ho to None."""
-    return getattr(msg, msg.media.value, None) if getattr(msg, "media", None) else None
-
 async def _backfill_media_meta(col, fid, existing, msg):
     """Thumbnail msg se width/height/mime_type nikal ke meta me save karta hai (sirf missing ho to).
 
@@ -162,7 +158,7 @@ async def _backfill_media_meta(col, fid, existing, msg):
     try:
         if existing and (existing.get("meta") or {}).get("w"):
             return  # pehle se maujood hai, dobara likhne ki zaroorat nahi
-        media = _msg_media(msg)
+        media = msg_media(msg)
         if not media:
             return
         meta = build_media_meta(media)
@@ -185,7 +181,7 @@ async def _backfill_duration(col, fid, existing, msg):
     try:
         if existing and existing.get("duration"):
             return  # pehle se maujood hai, dobara likhne ki zaroorat nahi
-        media = _msg_media(msg)
+        media = msg_media(msg)
         duration = int(getattr(media, "duration", 0) or 0)
         if duration > 0:
             await col.update_one({"_id": fid}, {"$set": {"duration": duration}})
@@ -307,10 +303,10 @@ def _build_results_list(all_m, mode):
             # ✅ NEW: video duration (e.g. "1:02:03"). Purani/unindexed files me duration
             # 0 hota hai, tab khali string jaati hai aur UI me chip ban hi nahi.
             "duration": get_duration_str(d.get("duration")),
-            # ✅ NEW: resolution chip (1280×720 → "720p", 1920×1080 → "1080p").
-            # meta.h se, warna file_name se (purani files) — kuch pata na chale to
-            # khali string, aur UI me chip ban hi nahi.
-            "res": doc_resolution_label(d),
+            # ✅ NEW: resolution chip — asli resolution jaisa "1280×720"
+            # (koi "720p"/"1080p" guess nahi). meta.w/h se, warna file_name se
+            # (purani files) — kuch pata na chale to khali, chip ban hi nahi.
+            "res": doc_resolution_text(d),
             "type": d.get("file_type", "document").upper(),
             "source": source_collection_name.capitalize(),
             "raw_collection": source_collection_name,

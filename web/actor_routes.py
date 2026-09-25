@@ -3,7 +3,7 @@ from aiohttp import web
 from bson.objectid import ObjectId
 from utils import temp, get_size, get_duration_str
 from info import MAX_WEB_RESULTS, ACTOR_STORAGE_CHANNEL
-from database.ia_filterdb import actors, get_actor_search_results, delete_actor_profile, delete_gallery_image_by_index, doc_resolution_label
+from database.ia_filterdb import actors, get_actor_search_results, delete_actor_profile, delete_gallery_image_by_index, doc_resolution_text
 # ✅ DRY: fast_json + DIRECTORY_CSS अब web_assets से आते हैं (पहले दोनों यहाँ copy थे)
 from web.web_assets import build_page, get_auth, form_wrapper, require_active_plan, fast_json, DIRECTORY_CSS, DEFAULT_CATALOG_MODE, DEFAULT_MEDIA_MODE
 
@@ -395,7 +395,7 @@ async def api_actor_search_handler(req):
         "raw_collection": d.get("source_col", "primary"),
         "size": get_size(d.get("file_size", 0)),
         "duration": get_duration_str(d.get("duration")),  # ✅ web-only video duration
-        "res": doc_resolution_label(d),  # ✅ resolution chip (meta.h ya file_name se)
+        "res": doc_resolution_text(d),  # ✅ resolution chip (asli W×H — meta ya file_name se)
         "type": d.get("file_type", "document").upper(),
         "source": d.get("source_col", "primary").capitalize(),
         "tg_thumb": f"/api/thumb?file_id={d.get('_id')}&col={d.get('source_col', 'primary')}&v={(d.get('thumb_url', '')[-8:] if str(d.get('thumb_url', '')).startswith('TG_ID:') else '0')}",

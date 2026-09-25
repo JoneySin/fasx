@@ -186,6 +186,74 @@ def build_media_meta(media):
         "mime": str(getattr(media, "mime_type", None) or ""),
     }
 
+def msg_media(msg):
+    """Telegram message se asli media object (video/document/...) nikalta hai; na ho to None.
+
+    ✅ DRY: ye helper pehle web/search_api.py me `_msg_media` ke naam se tha.
+    Meta-migration plugin ko bhi wahi chahiye, isliye yahan ek hi jagah rakha.
+    """
+    return getattr(msg, msg.media.value, None) if getattr(msg, "media", None) else None
+
+# ─────────────────────────────────────────────────────────
+# 🔄 OLD-INDEX META MIGRATION (duration + width/height + mime_type)
+# ✅ Purani indexed files me ye fields missing hain (baad me add hue the).
+# Inhe nikaalne ke liye poora channel dobara index karne ki zaroorat NAHI —
+# DB me saved `file_ref` (Telegram file_id) se hi file cached-media ki tarah
+# wapas mangwa sakte hain, aur jo message milta hai usme duration / width /
+# height / mime_type sab hota hai (warmup.py bilkul yahi karta hai).
+#
+# ⚠️ Jo is tarah NAHI mil sakta: msg_id / chat_id / msg_date (asli upload date).
+#    Unke liye channel ko dobara index karna hi padega.
+# ─────────────────────────────────────────────────────────
+def build_meta_migration_query():
+    """Jin docs me duration ya meta adhoora hai, unka mongo filter.
+
+    - `meta.v` missing/!= current  → meta kabhi likha hi nahi gaya (ya purana schema)
+    - video/animation/audio jinki `duration` 0/missing hai → duration adhoora
+      (DOCUMENTS ki duration legitimately 0 hoti hai, isliye wo match nahi hoti —
+      warna documents har run me dobara process hote rehte)
+    - `meta.err` wale (tooti hui file_ref) skip — warna har run me dobara fail honge
+    """
+    return {
+        "$and": [
+            {"meta.err": {"$exists": False}},
+            {"$or": [
+                {"meta.v": {"$ne": META_SCHEMA_VERSION}},
+                {"$and": [
+                    {"file_type": {"$in": ["video", "animation", "audio"]}},
+                    {"duration": {"$in": [0, None]}},
+                ]},
+            ]},
+        ],
+    }
+
+async def apply_media_meta_update(col, file_id, media):
+    """Fetched media object se duration + meta.w/h/mime DB me likh deta hai.
+
+    duration sirf tab likhte hain jab media par ho — documents par duration
+    attribute hota hi nahi, aur unki legit 0 duration overwrap nahi karni.
+    `meta.err` hata deta hai (agli baar query me dobara na aaye).
+    """
+    meta = build_media_meta(media)
+    set_payload = {f"meta.{k}": v for k, v in meta.items()}
+
+    duration = getattr(media, "duration", None)
+    if duration:
+        set_payload["duration"] = int(duration)
+
+    await col.update_one(
+        {"_id": file_id},
+        {"$set": set_payload, "$unset": {"meta.err": ""}},
+    )
+    return meta
+
+async def mark_meta_migration_error(col, file_id):
+    """Tooti hui file_ref wale doc ko mark karo taaki har run me dobara na uthe."""
+    await col.update_one(
+        {"_id": file_id},
+        {"$set": {"meta.err": int(time.time())}},
+    )
+
 # ─────────────────────────────────────────────────────────
 # 💾 SAVE FILE
 # ─────────────────────────────────────────────────────────
@@ -267,60 +335,47 @@ FILE_PROJECTION = {"_id": 1, "file_name": 1, "file_size": 1, "file_type": 1,
 FILE_PROJECTION_SCORED = {**FILE_PROJECTION, "score": {"$meta": "textScore"}}
 
 # ─────────────────────────────────────────────────────────
-# 🖼️ RESOLUTION LABEL (poster/poster-text chip ke liye)
-# 1280×720 → "720p", 1920×1080 → "1080p", 3840×2160 → "4K"
+# 🖼️ RESOLUTION TEXT (poster/poster-text chip ke liye)
+# User ki requirement: "jo resolution rahega wahi show karega" — isliye yahan
+# koi '720p'/'1080p' guess nahi hai. 1280×720 par "1280×720", 1245×655 par
+# "1245×655" — jaisa hai waisa.
 # ─────────────────────────────────────────────────────────
-# standard heights + unka label. Ek-doosre se 20%+ door hain, isliye ±5%
-# tolerance ke baad bhi ranges overlap nahi karti.
-STD_RESOLUTIONS = (
-    (4320, "8K"),
-    (2160, "4K"),
-    (1440, "1440p"),
-    (1080, "1080p"),
-    (720,  "720p"),
-    (576,  "576p"),
-    (480,  "480p"),
-    (360,  "360p"),
-)
-_RES_TOLERANCE = 0.05  # standard height ka ±5% — us ke andar "snap" hota hai
+# filename me explicit "1280x720" likha ho to (purani files ke liye fallback).
+# ⚠️ digits aur 'x' ke beech me SPACE allowed nahi — "2021 x265" (saal + codec)
+# jaisi aam filename par "2021×265" galat resolution nikal aata tha.
+_FILENAME_RES_RE = re.compile(r"\b(\d{3,4})[x×](\d{3,4})\b", re.IGNORECASE)
+# resolution ki sanity range (chhota ~320x240, bada ~8K)
+_RES_MIN_W, _RES_MAX_W = 320, 7680
+_RES_MIN_H, _RES_MAX_H = 200, 4320
 
-def get_resolution_label(height, file_name=""):
-    """height se '720p'/'1080p' jaisa label; meta na ho to file_name se guess.
+def get_resolution_text(width, height, file_name=""):
+    """Asli resolution '1280×720' format me deta hai; na mile to khaali string.
 
-    ⚠️ Pehle yahan coarse buckets the (h>=600 → "720p") — iski wajah se
-    1245×655 jaise odd-resolution file par bhi "720p" dikh jaata tha, jo jhooth
-    tha. Ab sirf tab standard label lagta hai jab height us ke ±5% ke andar ho;
-    warna asli height ("655p") — galat quality claim karne se behtar hai.
-
-    Kuch pata na chale to khaali string — UI me chip banta hi nahi (duration chip
-    jaise hi null-tolerant behaviour).
+    Resolution pata na chale (meta missing ya 0) to khaali — UI me chip banta hi
+    nahi (duration chip jaise hi null-tolerant behaviour).
     """
     try:
+        w = int(width or 0)
         h = int(height or 0)
     except (TypeError, ValueError):
-        h = 0
+        return ""
 
-    if h > 0:
-        for std, label in STD_RESOLUTIONS:
-            if abs(h - std) <= std * _RES_TOLERANCE:
-                return label
-        return f"{h}p"   # standard se door — asli height dikhao
+    if w > 0 and h > 0:
+        return f"{w}×{h}"
 
-    # meta khali (purani file) — file_name se guess karo
+    # meta khali (purani file) — filename me explicit resolution likha ho to use kalo
     if file_name:
-        m = re.search(r"\b(2160p|1440p|1080p|720p|576p|540p|480p|360p|4k|uhd|fhd)\b",
-                      str(file_name), re.IGNORECASE)
+        m = _FILENAME_RES_RE.search(str(file_name))
         if m:
-            tok = m.group(1).lower()
-            if tok in ("4k", "uhd"): return "4K"
-            if tok == "fhd": return "1080p"
-            return tok
+            fw, fh = int(m.group(1)), int(m.group(2))
+            if _RES_MIN_W <= fw <= _RES_MAX_W and _RES_MIN_H <= fh <= _RES_MAX_H:
+                return f"{fw}×{fh}"
     return ""
 
-def doc_resolution_label(doc):
-    """DB doc se resolution label (meta missing/None hone par bhi safe)."""
+def doc_resolution_text(doc):
+    """DB doc se resolution text (meta missing/None hone par bhi safe)."""
     meta = doc.get("meta") or {}
-    return get_resolution_label(meta.get("h", 0), doc.get("file_name", ""))
+    return get_resolution_text(meta.get("w", 0), meta.get("h", 0), doc.get("file_name", ""))
 
 # ─────────────────────────────────────────────────────────
 # 🧩 QUERY → MONGO FILTER BUILDER (single source of truth)

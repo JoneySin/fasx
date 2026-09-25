@@ -90,6 +90,7 @@ Choose a category below. 👇</b>"""
 • /prm_list - Premium users
 • /web_users - Web users
 • /warmup_thumbs - Refresh thumbnails
+• /migrate_meta - Fill missing duration, resolution &amp; mime in old files
 • /restart - Restart bot
 • /users - Export users.txt backup
 • /chats - Export chats.txt backup
