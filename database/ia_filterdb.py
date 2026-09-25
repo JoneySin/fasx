@@ -167,6 +167,150 @@ async def get_post_category_counts():
             counts.get("Porn", 0))
 
 # ─────────────────────────────────────────────────────────
+# 📐 MEDIA META (resolution + container) — INDEX-TIME CAPTURE
+# ✅ width / height / mime_type Telegram se SIRF indexing ke waqt milte hain.
+# Inhe baad me nikaalne ke liye poora channel dobara scan karna padega
+# (flood-wait + ghante), isliye ye teen fields abhi hi save kar lete hain —
+# aage se "1080p only", "mkv only", aspect-ratio jaise filter isi se banenge.
+# Document par width/height hota hi nahi (getattr se safe) aur mime_type kabhi
+# None bhi ho sakta hai, isliye dono ke liye sane default (0 / "") rakhe hain.
+# ─────────────────────────────────────────────────────────
+META_SCHEMA_VERSION = 1  # future me meta ka shape badle to version bump ho jayega
+
+def build_media_meta(media):
+    """media object se {v, w, h, mime} dict banata hai (pure function — testable)."""
+    return {
+        "v": META_SCHEMA_VERSION,
+        "w": int(getattr(media, "width", 0) or 0),
+        "h": int(getattr(media, "height", 0) or 0),
+        "mime": str(getattr(media, "mime_type", None) or ""),
+    }
+
+def msg_media(msg):
+    """Telegram message se asli media object (video/document/...) nikalta hai; na ho to None.
+
+    ✅ DRY: ye helper pehle web/search_api.py me `_msg_media` ke naam se tha.
+    Meta-migration plugin ko bhi wahi chahiye, isliye yahan ek hi jagah rakha.
+    """
+    return getattr(msg, msg.media.value, None) if getattr(msg, "media", None) else None
+
+# ─────────────────────────────────────────────────────────
+# 🎬 ASLI MEDIA TYPE — "document" me chhupi video/audio bhi pakadta hai
+# ⚠️ YE WOH GADBAD HAI JO REPAIR HOGI: kuch asli video files Telegram par
+#    "document" ki tarah store ho gayi thi (client ne unhe file ki tarah bheja,
+#    video ki tarah nahi), to index ke waqt `type(media).__name__` = "document"
+#    likh diya gaya. File khud video hai — uska mime_type `video/mp4` /
+#    `video/x-matroska` hota hai. Isliye document ke liye mime_type dekh kar
+#    asli type nikalte hain, taaki galat type wapas se na bane.
+#
+# ⚠️ LEKIN: Document object par `duration` / `width` / `height`
+#    ATTRIBUTE HI NAHI HOTA (sirf file_id, file_name, mime_type, file_size,
+#    thumbs). To aisi file ka duration/w/h is tarah NAHI mil sakta — uske liye
+#    file download karke probe karna padega (ya dobara index). Sirf TYPE theek
+#    ho jayega, aur ye bhi bina re-index ke.
+#
+# ℹ️ `image/*` (jpg/png/gif document) jaan-boojhkar nahi chhedte — Telegram
+#    khud unhe document hi rakhta hai, aur search UI video/document maangta hai.
+# ─────────────────────────────────────────────────────────
+_DOC_MIME_TYPE_MAP = (
+    ("video/", "video"),
+    ("audio/", "audio"),
+)
+
+def media_true_type(media):
+    """Media ka asli type — Telegram object se, warna mime_type se.
+
+    Document jo asli me video/audio hai use "video"/"audio" deta hai (pure
+    function, isliye seedhe testable).
+    """
+    obj_type = type(media).__name__.lower()
+    if obj_type != "document":
+        return obj_type
+    mime = (getattr(media, "mime_type", None) or "").lower()
+    for prefix, real in _DOC_MIME_TYPE_MAP:
+        if mime.startswith(prefix):
+            return real
+    return obj_type
+
+# ─────────────────────────────────────────────────────────
+# 🔄 OLD-INDEX META MIGRATION (duration + width/height + mime_type)
+# ✅ Purani indexed files me ye fields missing hain (baad me add hue the).
+# Inhe nikaalne ke liye poora channel dobara index karne ki zaroorat NAHI —
+# DB me saved `file_ref` (Telegram file_id) se hi file cached-media ki tarah
+# wapas mangwa sakte hain, aur jo message milta hai usme duration / width /
+# height / mime_type sab hota hai (warmup.py bilkul yahi karta hai).
+#
+# ⚠️ Jo is tarah NAHI mil sakta: msg_id / chat_id / msg_date (asli upload date).
+#    Unke liye channel ko dobara index karna hi padega.
+# ─────────────────────────────────────────────────────────
+def build_meta_migration_query():
+    """Jin docs me duration ya meta adhoora hai, unka mongo filter.
+
+    - `meta.v` missing/!= current  → meta kabhi likha hi nahi gaya (ya purana schema)
+    - `file_type` "document" hai par `meta.mime` video/audio ka → asli me video/audio
+      file galat tarah se index hui thi (mime_type se pakad kar theek karte hain).
+      ℹ️ Ye files Telegram par ASLI VIDEO hain (play bhi hoti hain) — sirf DB
+      me purane code ke bug se "document" likh gaya tha. Isliye inhe fetch karne
+      par poora Video object milta hai, aur duration + w + h + mime + type sab
+      ek saath theek ho jaata hai.
+    - `meta.err` wale (tooti hui file_ref) skip — warna har run me dobara fail honge
+
+    ℹ️ "duration adhoora" wala branch jaan-boojhkar NAHI hai: jo doc par
+    `meta.v` already set hai uski duration 0 hi rahegi (Document object par
+    duration attribute hota hi nahi), to wo har run me dobara uthati — bina koi
+    fayda. Pehli baar process hone ke baad doc query se apne aap nikal jaati hai.
+    """
+    return {
+        "$and": [
+            {"meta.err": {"$exists": False}},
+            {"$or": [
+                {"meta.v": {"$ne": META_SCHEMA_VERSION}},
+                {"$and": [
+                    {"file_type": "document"},
+                    {"meta.mime": {"$regex": r"^(video|audio)/"}},
+                ]},
+            ]},
+        ],
+    }
+
+async def apply_media_meta_update(col, file_id, media, current_type=None):
+    """Fetched media object se duration + meta.w/h/mime DB me likh deta hai.
+
+    duration sirf tab likhte hain jab media par ho — documents par duration
+    attribute hota hi nahi, aur unki legit 0 duration overwrap nahi karni.
+    `meta.err` hata deta hai (agli baar query me dobara na aaye).
+
+    🎬 `current_type` diya ho to galat `file_type` bhi theek karta hai:
+    document likha hai par asli me video/audio hai (mime_type se pata chalta
+    hai) → "video"/"audio" likh deta hai. Isse wo doc query se nikal jaata hai,
+    to ye ek hi baar chalta hai (infinite loop nahi hota).
+    """
+    meta = build_media_meta(media)
+    set_payload = {f"meta.{k}": v for k, v in meta.items()}
+
+    duration = getattr(media, "duration", None)
+    if duration:
+        set_payload["duration"] = int(duration)
+
+    if current_type is not None:
+        true_type = media_true_type(media)
+        if true_type != current_type:
+            set_payload["file_type"] = true_type
+
+    await col.update_one(
+        {"_id": file_id},
+        {"$set": set_payload, "$unset": {"meta.err": ""}},
+    )
+    return meta
+
+async def mark_meta_migration_error(col, file_id):
+    """Tooti hui file_ref wale doc ko mark karo taaki har run me dobara na uthe."""
+    await col.update_one(
+        {"_id": file_id},
+        {"$set": {"meta.err": int(time.time())}},
+    )
+
+# ─────────────────────────────────────────────────────────
 # 💾 SAVE FILE
 # ─────────────────────────────────────────────────────────
 async def save_file(media, collection_type="primary"):
@@ -176,7 +320,9 @@ async def save_file(media, collection_type="primary"):
 
         f_name  = re.sub(r"@\w+|(_|\-|\.|\+)", " ", str(media.file_name or "")).strip()
         caption = re.sub(r"@\w+|(_|\-|\.|\+)", " ", str(media.caption  or "")).strip()
-        file_type = type(media).__name__.lower()
+        # ✅ asli type (document me chhupi video/audio bhi "video"/"audio") —
+        # warna wahi gadbad dobara hoti jo purani files me hui hai
+        file_type = media_true_type(media)
         col = COLLECTIONS.get(collection_type, primary)
         
         existing_doc = await col.find_one({"_id": file_id}, {"_id": 1})
@@ -188,13 +334,21 @@ async def save_file(media, collection_type="primary"):
         # hydrogram me Video/Animation/Audio par .duration hota hai, Document par nahi,
         # isliye getattr se safe rakha hai (documents ke liye 0 → UI me chip hide).
         duration = int(getattr(media, "duration", 0) or 0)
+        meta = build_media_meta(media)
 
+        # ✅ meta ko dotted keys ($set: {"meta.w": ...}) se likhna zaroori hai —
+        # agar poora "meta" sub-document ek $set me bhejte, to future me kisi
+        # naye meta field ke backfill ka data isi write se mit jaata.
         update_set = {
             "file_ref":  media.file_id,
             "file_name": f_name,
             "file_size": media.file_size,
             "file_type": file_type,
             "duration":  duration,
+            "meta.v":    meta["v"],
+            "meta.w":    meta["w"],
+            "meta.h":    meta["h"],
+            "meta.mime": meta["mime"],
         }
 
         update_payload = {"$set": update_set, "$setOnInsert": {"added_on": time.time()}}
@@ -230,10 +384,56 @@ def _build_regex(query: str):
 
 # ─────────────────────────────────────────────────────────
 # 📑 SHARED PROJECTION (पहले यह 7 जगह हुबहू टाइप किया गया था)
+# ✅ meta bhi projection me hai — web/search API ko resolution & container
+# chahiye hoti hai (filter/dropdown ke liye), aur yeh sirf ~40 bytes/doc ka hai.
 # ─────────────────────────────────────────────────────────
 FILE_PROJECTION = {"_id": 1, "file_name": 1, "file_size": 1, "file_type": 1,
-                   "file_ref": 1, "caption": 1, "thumb_url": 1, "duration": 1}
+                   "file_ref": 1, "caption": 1, "thumb_url": 1, "duration": 1,
+                   "meta": 1}
 FILE_PROJECTION_SCORED = {**FILE_PROJECTION, "score": {"$meta": "textScore"}}
+
+# ─────────────────────────────────────────────────────────
+# 🖼️ RESOLUTION TEXT (poster/poster-text chip ke liye)
+# User ki requirement: "jo resolution rahega wahi show karega" — isliye yahan
+# koi '720p'/'1080p' guess nahi hai. 1280×720 par "1280×720", 1245×655 par
+# "1245×655" — jaisa hai waisa.
+# ─────────────────────────────────────────────────────────
+# filename me explicit "1280x720" likha ho to (purani files ke liye fallback).
+# ⚠️ digits aur 'x' ke beech me SPACE allowed nahi — "2021 x265" (saal + codec)
+# jaisi aam filename par "2021×265" galat resolution nikal aata tha.
+_FILENAME_RES_RE = re.compile(r"\b(\d{3,4})[x×](\d{3,4})\b", re.IGNORECASE)
+# resolution ki sanity range (chhota ~320x240, bada ~8K)
+_RES_MIN_W, _RES_MAX_W = 320, 7680
+_RES_MIN_H, _RES_MAX_H = 200, 4320
+
+def get_resolution_text(width, height, file_name=""):
+    """Asli resolution '1280×720' format me deta hai; na mile to khaali string.
+
+    Resolution pata na chale (meta missing ya 0) to khaali — UI me chip banta hi
+    nahi (duration chip jaise hi null-tolerant behaviour).
+    """
+    try:
+        w = int(width or 0)
+        h = int(height or 0)
+    except (TypeError, ValueError):
+        return ""
+
+    if w > 0 and h > 0:
+        return f"{w}×{h}"
+
+    # meta khali (purani file) — filename me explicit resolution likha ho to use kalo
+    if file_name:
+        m = _FILENAME_RES_RE.search(str(file_name))
+        if m:
+            fw, fh = int(m.group(1)), int(m.group(2))
+            if _RES_MIN_W <= fw <= _RES_MAX_W and _RES_MIN_H <= fh <= _RES_MAX_H:
+                return f"{fw}×{fh}"
+    return ""
+
+def doc_resolution_text(doc):
+    """DB doc se resolution text (meta missing/None hone par bhi safe)."""
+    meta = doc.get("meta") or {}
+    return get_resolution_text(meta.get("w", 0), meta.get("h", 0), doc.get("file_name", ""))
 
 # ─────────────────────────────────────────────────────────
 # 🧩 QUERY → MONGO FILTER BUILDER (single source of truth)

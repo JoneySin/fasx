@@ -196,6 +196,10 @@ async function doSearch(o,allowEmpty){
                tab chip banta hi nahi — "0:00" jaisa bekaar text nahi dikhta. */
             var durChip  = f.duration ? '<span class="dur-chip">'+f.duration+'</span>' : '';
             var durText  = f.duration ? '<span class="tc-dur">'+f.duration+'</span>' : '';
+            /* 🖼️ Resolution chip (1280×720 → "720p", 1920×1080 → "1080p") — duration chip
+               jaisa hi null-tolerant: data na ho to chip banta hi nahi. */
+            var resChip  = f.res ? '<span class="res-chip">'+f.res+'</span>' : '';
+            var resText  = f.res ? '<span class="tc-res">'+f.res+'</span>' : '';
 
             var posterHtml='';
             if(pMode!=='none'){
@@ -204,7 +208,7 @@ async function doSearch(o,allowEmpty){
                     '<div class="poster-top">'+
                         '<span class="type-chip">'+f.type.toUpperCase()+'</span>'+
                         '<span class="size-chip">'+f.size+'</span>'+
-                        durChip+
+                        durChip+resChip+
                         '<span class="source-pill '+sc+'"><span class="source-dot"></span>'+sc.toUpperCase()+'</span>'+
                     '</div>'+
                     adminBtns+
@@ -216,7 +220,7 @@ async function doSearch(o,allowEmpty){
                 textInfo='<div class="fc-text-info" onclick="toggleAdminBtns(this.closest(\\'.file-card\\'),event)">'+
                     '<span class="tc-type">'+f.type.toUpperCase()+'</span>'+
                     '<span class="tc-size">'+f.size+'</span>'+
-                    durText+
+                    durText+resText+
                     '<span class="source-pill '+sc+'" style="margin-left:auto"><span class="source-dot"></span>'+sc.toUpperCase()+'</span>'+
                 '</div>';
                 if(d.is_admin){

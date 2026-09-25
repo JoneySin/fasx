@@ -10,6 +10,7 @@ Run:  python -m unittest discover -s tests -v
 """
 import os
 import sys
+import inspect
 import unittest
 
 # ── info.py ko import-time validation se bachane ke liye env stubs ──
@@ -814,6 +815,178 @@ class TestDurationBackfill(unittest.TestCase):
         asyncio.run(_backfill_duration(BoomCol(), "FID", {}, None))  # raise nahi karna chahiye
 
 
+class TestMediaMetaCapture(unittest.TestCase):
+    """Indexing ke waqt width/height/mime_type DB me save hone chahiye.
+
+    Ye teen fields Telegram se sirf index ke waqt milte hain — baad me nikaalne
+    ke liye poora channel dobara scan karna padta (flood + time).
+    """
+
+    def test_build_media_meta_from_video(self):
+        from database.ia_filterdb import build_media_meta
+
+        class FakeVideo:
+            width = 1920
+            height = 1080
+            mime_type = "video/mp4"
+
+        meta = build_media_meta(FakeVideo())
+        self.assertEqual(meta["w"], 1920)
+        self.assertEqual(meta["h"], 1080)
+        self.assertEqual(meta["mime"], "video/mp4")
+        self.assertEqual(meta["v"], 1)
+
+    def test_build_media_meta_document_has_no_dimensions(self):
+        """Document par width/height attribute hota hi nahi — crash nahi hona chahiye."""
+        from database.ia_filterdb import build_media_meta
+
+        class FakeDoc:
+            mime_type = "application/pdf"
+
+        meta = build_media_meta(FakeDoc())
+        self.assertEqual(meta["w"], 0)
+        self.assertEqual(meta["h"], 0)
+        self.assertEqual(meta["mime"], "application/pdf")
+
+    def test_build_media_meta_none_mime_becomes_empty_string(self):
+        from database.ia_filterdb import build_media_meta
+
+        class Weird:
+            width = 1280
+            height = 720
+            mime_type = None
+
+        meta = build_media_meta(Weird())
+        self.assertEqual(meta["mime"], "")
+        self.assertEqual((meta["w"], meta["h"]), (1280, 720))
+
+    def test_save_file_persists_meta_as_dotted_keys(self):
+        """meta dotted ($set: meta.w) se likhna chahiye taaki naya meta field
+        backfill karte waqt purane meta keys mit na jaayein."""
+        import asyncio
+        from unittest import mock
+        import database.ia_filterdb as fdb
+
+        class FakeVideo:
+            file_id = "CQADtest"
+            file_name = "Movie_2020_1080p.mkv"
+            caption = None
+            file_size = 12345
+            duration = 7260
+            width = 1920
+            height = 1080
+            mime_type = "video/x-matroska"
+
+        captured = {}
+
+        class FakeCol:
+            async def find_one(self, *a, **k): return None
+            async def update_one(self, flt, payload, **k): captured.update(payload)
+
+        with mock.patch.object(fdb, "unpack_new_file_id", return_value="ABC123"), \
+             mock.patch.object(fdb, "COLLECTIONS", {"primary": FakeCol()}):
+            result = asyncio.run(fdb.save_file(FakeVideo(), "primary"))
+
+        self.assertEqual(result, "suc")
+        self.assertEqual(captured["$set"]["meta.w"], 1920)
+        self.assertEqual(captured["$set"]["meta.h"], 1080)
+        self.assertEqual(captured["$set"]["meta.mime"], "video/x-matroska")
+        self.assertNotIn("meta", captured["$set"],
+                         "poora meta sub-document ek $set me nahi, dotted keys honi chahiye")
+
+    def test_save_file_document_meta_is_zero_not_missing(self):
+        import asyncio
+        from unittest import mock
+        import database.ia_filterdb as fdb
+
+        class FakeDoc:
+            file_id = "CQADtest"
+            file_name = "book.pdf"
+            caption = None
+            file_size = 999
+
+        captured = {}
+
+        class FakeCol:
+            async def find_one(self, *a, **k): return None
+            async def update_one(self, flt, payload, **k): captured.update(payload)
+
+        with mock.patch.object(fdb, "unpack_new_file_id", return_value="ABC999"), \
+             mock.patch.object(fdb, "COLLECTIONS", {"primary": FakeCol()}):
+            result = asyncio.run(fdb.save_file(FakeDoc(), "primary"))
+
+        self.assertEqual(result, "suc")
+        self.assertEqual(captured["$set"]["meta.w"], 0)
+        self.assertEqual(captured["$set"]["meta.h"], 0)
+        self.assertEqual(captured["$set"]["meta.mime"], "")
+
+    def test_projection_includes_meta(self):
+        from database.ia_filterdb import FILE_PROJECTION, FILE_PROJECTION_SCORED
+        self.assertEqual(FILE_PROJECTION.get("meta"), 1)
+        self.assertEqual(FILE_PROJECTION_SCORED.get("meta"), 1)
+
+
+class TestMediaMetaBackfill(unittest.TestCase):
+    """Purani files: thumbnail fetch ke waqt meta free me backfill hota hai."""
+
+    def _run(self, existing, width=1920, height=1080, mime="video/x-matroska", has_media=True):
+        import asyncio
+        from unittest import mock
+        from web.search_api import _backfill_media_meta
+
+        writes = []
+
+        class FakeCol:
+            async def update_one(self, flt, payload, **k): writes.append(payload)
+
+        # class body me `width = width` likhne se NameError aata hai (class-body
+        # name lookup enclosing function scope nahi karta), isliye attributes
+        # class banne ke baad set kiye jaate hain.
+        class FakeMedia:
+            pass
+
+        FakeMedia.width = width
+        FakeMedia.height = height
+        FakeMedia.mime_type = mime
+
+        msg = mock.MagicMock()
+        msg.media = mock.MagicMock()
+        msg.media.value = "video"
+        msg.video = FakeMedia() if has_media else None
+
+        asyncio.run(_backfill_media_meta(FakeCol(), "FID", existing, msg))
+        return writes
+
+    def test_backfills_when_missing(self):
+        writes = self._run({"_id": "FID"})
+        self.assertEqual(writes, [{"$set": {
+            "meta.v": 1, "meta.w": 1920, "meta.h": 1080, "meta.mime": "video/x-matroska"
+        }}])
+
+    def test_skips_when_already_present(self):
+        writes = self._run({"_id": "FID", "meta": {"v": 1, "w": 640, "h": 480, "mime": "video/mp4"}})
+        self.assertEqual(writes, [], "meta pehle se hai to dobara write nahi hona chahiye")
+
+    def test_skips_when_msg_has_nothing_useful(self):
+        """Document (na width/height, na mime) par likhne layak kuch nahi hai."""
+        writes = self._run({"_id": "FID"}, width=0, height=0, mime="")
+        self.assertEqual(writes, [])
+
+    def test_skips_when_msg_media_missing(self):
+        writes = self._run({"_id": "FID"}, has_media=False)
+        self.assertEqual(writes, [])
+
+    def test_never_raises(self):
+        """Thumbnail flow ko meta backfill ki wajah se kabhi fail nahi hona chahiye."""
+        import asyncio
+        from web.search_api import _backfill_media_meta
+
+        class BoomCol:
+            async def update_one(self, *a, **k): raise RuntimeError("db down")
+
+        asyncio.run(_backfill_media_meta(BoomCol(), "FID", {}, None))  # raise nahi karna chahiye
+
+
 class TestDurationOnlyOnWeb(unittest.TestCase):
     """User ne kaha 'sirf web per' — Telegram bot ke messages me duration nahi jaana chahiye."""
 
@@ -950,6 +1123,575 @@ class TestCommandListMatchesHandlers(unittest.TestCase):
                      "resetwarn", "addblacklist", "removeblacklist",
                      "blacklist", "dlink", "removedlink", "dlinklist"):
             self.assertNotIn(gone, listed, f"/{gone} wapas list me aa gaya")
+
+
+class TestResolutionChip(unittest.TestCase):
+    """Resolution chip asli W×H dikhaye — koi '720p'/'1080p' guess nahi.
+
+    User ki requirement: "jo resolution rahega wahi show karega".
+    """
+
+    def test_shows_actual_resolution(self):
+        from database.ia_filterdb import get_resolution_text
+        self.assertEqual(get_resolution_text(1280, 720), "1280×720")
+        self.assertEqual(get_resolution_text(1920, 1080), "1920×1080")
+        self.assertEqual(get_resolution_text(3840, 2160), "3840×2160")
+        self.assertEqual(get_resolution_text(2560, 1440), "2560×1440")
+
+    def test_odd_resolution_shown_as_is(self):
+        """1245×655 jaisi non-standard file par bhi jhooth nahi — waisa hi dikhe."""
+        from database.ia_filterdb import get_resolution_text
+        self.assertEqual(get_resolution_text(1245, 655), "1245×655")
+        self.assertEqual(get_resolution_text(1920, 800), "1920×800")
+        self.assertEqual(get_resolution_text(1278, 536), "1278×536")
+
+    def test_portrait_video_shows_actual_dimensions(self):
+        """1080×1920 vertical clip par bhi asli dimensions (koi '1080p' guess nahi)."""
+        from database.ia_filterdb import get_resolution_text
+        self.assertEqual(get_resolution_text(1080, 1920), "1080×1920")
+
+    def test_missing_dimensions_give_empty(self):
+        from database.ia_filterdb import get_resolution_text
+        self.assertEqual(get_resolution_text(0, 0), "")
+        self.assertEqual(get_resolution_text(0, 720), "")   # width missing
+        self.assertEqual(get_resolution_text(1280, 0), "")  # height missing
+        self.assertEqual(get_resolution_text(None, None), "")
+        self.assertEqual(get_resolution_text("", ""), "")
+
+    def test_filename_fallback_only_for_explicit_resolution(self):
+        from database.ia_filterdb import get_resolution_text
+        # purani file — meta khali, par filename me resolution likha hai
+        self.assertEqual(get_resolution_text(0, 0, "Movie 2021 1280x720 hindi"), "1280×720")
+        self.assertEqual(get_resolution_text(0, 0, "Movie 2021 1920X1080"), "1920×1080")
+        self.assertEqual(get_resolution_text(0, 0, "Movie 2021 1280×720"), "1280×720")
+        # 'x264'/'x265' aur "saal + codec" resolution nahi hain
+        self.assertEqual(get_resolution_text(0, 0, "Movie 2021 x265 1080p"), "")
+        self.assertEqual(get_resolution_text(0, 0, "Movie 2021 x264"), "")
+        self.assertEqual(get_resolution_text(0, 0, "Movie 2021 720p"), "")
+        self.assertEqual(get_resolution_text(0, 0, "Movie 2021"), "")
+        # 'x' ke aas-paas space wale form bhi skip — "2021 x265" jaisa false
+        # positive ("2021×265") rokne ke liye ye jaan-boojhkar chhoda gaya hai
+        self.assertEqual(get_resolution_text(0, 0, "Movie 3840 × 2160"), "")
+
+    def test_no_p_labels_anywhere(self):
+        """Regression: '720p'/'1080p' style labels wapas na aa jaayein."""
+        from database.ia_filterdb import get_resolution_text
+        for w, h in [(1280, 720), (1920, 1080), (1245, 655), (640, 360)]:
+            out = get_resolution_text(w, h)
+            self.assertNotIn("p", out, f"{w}x{h} par p-label aa gaya: {out}")
+
+    def test_doc_resolution_text_safe_without_meta(self):
+        from database.ia_filterdb import doc_resolution_text
+        self.assertEqual(doc_resolution_text({"meta": {"w": 1920, "h": 1080}}), "1920×1080")
+        self.assertEqual(doc_resolution_text({"meta": {"w": 1245, "h": 655}}), "1245×655")
+        self.assertEqual(doc_resolution_text({"file_name": "Old 1280x720 Movie"}), "1280×720")
+        self.assertEqual(doc_resolution_text({"file_name": "Old Movie"}), "")
+        self.assertEqual(doc_resolution_text({}), "")
+        self.assertEqual(doc_resolution_text({"meta": None, "file_name": "x"}), "")
+        # documents (meta me sirf mime) par kuch nahi
+        self.assertEqual(doc_resolution_text({"meta": {"w": 0, "h": 0, "mime": "application/pdf"},
+                                              "file_name": "book.pdf"}), "")
+
+
+class TestResInApiResponse(unittest.TestCase):
+    """Web search API ke JSON me resolution field aana chahiye."""
+
+    def test_res_from_meta(self):
+        from web.search_api import _build_results_list
+        docs = [{"_id": "F1", "file_ref": "R1", "file_name": "Movie 2020",
+                 "file_size": 1048576, "file_type": "video", "duration": 7260,
+                 "meta": {"v": 1, "w": 1920, "h": 1080, "mime": "video/mp4"},
+                 "source_col": "primary", "thumb_url": ""}]
+        self.assertEqual(_build_results_list(docs, "tg")[0]["res"], "1920×1080")
+
+    def test_res_falls_back_to_filename(self):
+        from web.search_api import _build_results_list
+        docs = [{"_id": "F2", "file_ref": "R2", "file_name": "Old Movie 1280x720",
+                 "file_size": 100, "file_type": "video",
+                 "source_col": "cloud", "thumb_url": ""}]
+        self.assertEqual(_build_results_list(docs, "none")[0]["res"], "1280×720")
+
+    def test_res_empty_when_unknown(self):
+        from web.search_api import _build_results_list
+        docs = [{"_id": "F3", "file_ref": "R3", "file_name": "book.pdf",
+                 "file_size": 100, "file_type": "document",
+                 "source_col": "primary", "thumb_url": ""}]
+        self.assertEqual(_build_results_list(docs, "tg")[0]["res"], "")
+
+
+class TestResInWebUI(unittest.TestCase):
+    """Resolution chip dashboard + miniapp + actor-profile teeno me dikhna chahiye."""
+
+    def test_shared_css_has_resolution_chip(self):
+        import web.web_assets as wa
+        # res-chip/tc-res dashboard + actor-profile dono me use hote hain (shared CSS)
+        self.assertIn(".res-chip", wa.CSS)
+        self.assertIn(".tc-res", wa.CSS)
+
+    def test_dashboard_renders_res_chip(self):
+        import web.dashboard_routes as dash
+        self.assertIn("resChip", dash.JS_ENGINE)
+        self.assertIn("resText", dash.JS_ENGINE)
+        self.assertIn("durChip+resChip", dash.JS_ENGINE)
+        self.assertIn("durText+resText", dash.JS_ENGINE)
+
+    def test_miniapp_renders_res_chip(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "web", "miniapp.html")
+        with open(path, encoding="utf-8") as f:
+            html = f.read()
+        self.assertIn('class="rc"', html)
+        self.assertIn('class="tr"', html)
+        self.assertIn("${dc}${rc}", html)
+        self.assertIn("${td}${tr}", html)
+
+    def test_actor_profile_renders_res_chip(self):
+        import inspect
+        import web.actor_routes as ar
+        src = inspect.getsource(ar)
+        self.assertIn('"res": doc_resolution_text(d)', src)
+        self.assertIn("+durC+resC+", src)
+        self.assertIn("+durT+resT+", src)
+
+    def test_no_filter_dropdowns_present_yet(self):
+        """Quality/year dropdowns jaan-boojhkar baad ke liye rakhe hain — abhi
+        inka koi UI/param mojood nahi hona chahiye."""
+        import web.dashboard_routes as dash
+        import web.search_api as sa
+        self.assertNotIn("curQy", dash.JS_ENGINE)
+        self.assertNotIn("pickQy", dash.SEARCH_ZONE)
+        self.assertNotIn("qy", sa.api_search.__code__.co_names)
+        from database.ia_filterdb import build_query_filter
+        self.assertNotIn("quality", build_query_filter.__code__.co_varnames)
+
+
+def build_q():
+    from database.ia_filterdb import build_meta_migration_query
+    return build_meta_migration_query()
+
+
+def _doc_matches(query, doc):
+    """Query ko doc par match karta hai — MongoDB jaisa semantics.
+
+    - top-level "$and" list = AND; har element me keys implicitly AND hote hain
+    - "$exists": field hai ya nahi
+    - "$ne": missing field bhi match karta hai (missing = None, None != 1)
+    - "$in" me None missing field ko bhi match karta hai
+    """
+    def _resolve(field, d):
+        """Dotted path resolve karo — 'meta.v' → d['meta']['v'] (MongoDB jaisa)."""
+        cur = d
+        for part in field.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                return None, False
+            cur = cur[part]
+        return cur, True
+
+    def _field_match(field, spec, d):
+        actual, present = _resolve(field, d)
+        if isinstance(spec, dict) and spec and all(k.startswith("$") for k in spec):
+            for op, val in spec.items():
+                if op == "$exists":
+                    if present != val:
+                        return False
+                elif op == "$ne":
+                    if present and actual == val:
+                        return False
+                elif op == "$regex":
+                    import re as _re
+                    actual_str = "" if not present else str(actual)
+                    if not _re.search(val, actual_str):
+                        return False
+                elif op == "$in":
+                    # missing field = None; `$in: [null]` missing ko bhi match karta hai
+                    if (actual if present else None) not in val:
+                        return False
+                else:
+                    raise AssertionError(f"test matcher me '{op}' handle nahi hai")
+            return True
+        return present and actual == spec
+
+    def _cond_match(cond, d):
+        for key, val in cond.items():
+            if key == "$or":
+                if not any(_cond_match(c, d) for c in val):
+                    return False
+            elif key == "$and":
+                if not all(_cond_match(c, d) for c in val):
+                    return False
+            elif not _field_match(key, val, d):
+                return False
+        return True
+
+    return all(_cond_match(part, doc) for part in query.get("$and", [query]))
+
+
+class TestMetaMigrationQuery(unittest.TestCase):
+    """Purani files ke liye migration query — sirf adhoore docs chune."""
+
+    def test_matches_video_without_meta(self):
+        self.assertTrue(_doc_matches(build_q(), {"file_type": "video"}))
+
+    def test_document_with_video_mime_is_matched(self):
+        """Asli video file par 'document' likha hai — mime_type se pakad kar theek karo."""
+        doc = {"file_type": "document", "meta": {"v": 1, "mime": "video/mp4"}}
+        self.assertTrue(_doc_matches(build_q(), doc))
+
+    def test_document_with_matroska_mime_is_matched(self):
+        doc = {"file_type": "document", "meta": {"v": 1, "mime": "video/x-matroska"}}
+        self.assertTrue(_doc_matches(build_q(), doc))
+
+    def test_document_with_audio_mime_is_matched(self):
+        doc = {"file_type": "document", "meta": {"v": 1, "mime": "audio/mpeg"}}
+        self.assertTrue(_doc_matches(build_q(), doc))
+
+    def test_real_document_not_matched(self):
+        """Asli document (pdf/jpg) ko chhedna nahi — wo dobara na ute."""
+        for mime in ("application/pdf", "image/jpeg", "image/gif", ""):
+            doc = {"file_type": "document", "meta": {"v": 1, "mime": mime}}
+            self.assertFalse(_doc_matches(build_q(), doc), mime)
+
+    def test_already_fixed_video_not_matched(self):
+        """Type theek ho chuka (video) aur meta bhi hai — dobara na uthe."""
+        doc = {"file_type": "video", "duration": 0, "meta": {"v": 1, "mime": "video/mp4"}}
+        self.assertFalse(_doc_matches(build_q(), doc))
+
+    def test_video_with_meta_but_zero_duration_not_matched(self):
+        """Document object par duration attribute hi nahi — retry karne se kuch
+        nahi milega, isliye aisa doc dobara nahi uthta (infinite loop se bachne ke liye)."""
+        doc = {"file_type": "video", "duration": 0, "meta": {"v": 1, "w": 1920, "h": 1080}}
+        self.assertFalse(_doc_matches(build_q(), doc))
+
+    def test_complete_video_not_matched(self):
+        doc = {"file_type": "video", "duration": 7260,
+               "meta": {"v": 1, "w": 1920, "h": 1080, "mime": "video/mp4"}}
+        self.assertFalse(_doc_matches(build_q(), doc))
+
+    def test_documents_not_matched_forever(self):
+        """Documents ki duration legitimately 0 hoti hai — wo har run me na ute."""
+        doc = {"file_type": "document", "duration": 0,
+               "meta": {"v": 1, "w": 0, "h": 0, "mime": "application/pdf"}}
+        self.assertFalse(_doc_matches(build_q(), doc))
+
+    def test_document_without_meta_is_matched(self):
+        # meta hi nahi hai → match (mime_type bhi chahiye)
+        self.assertTrue(_doc_matches(build_q(), {"file_type": "document"}))
+
+    def test_errored_refs_skipped(self):
+        """meta.err wale (tooti file_ref) dobara na uthe."""
+        doc = {"file_type": "video", "meta": {"err": 1690000000}}
+        self.assertFalse(_doc_matches(build_q(), doc))
+
+    def test_query_is_deterministic(self):
+        self.assertEqual(build_q(), build_q())
+
+
+class TestMediaTrueType(unittest.TestCase):
+    """Document me chhupi video/audio ka asli type — mime_type se."""
+
+    def setUp(self):
+        from database.ia_filterdb import media_true_type
+        globals()["media_true_type"] = media_true_type
+
+    def test_video_object(self):
+        class V:
+            pass
+        V.__name__ = "Video"
+        self.assertEqual(media_true_type(V()), "video")
+
+    def test_document_with_video_mime(self):
+        class D:
+            mime_type = "video/mp4"
+        D.__name__ = "Document"
+        self.assertEqual(media_true_type(D()), "video")
+
+    def test_document_with_matroska_mime(self):
+        class D:
+            mime_type = "video/x-matroska"
+        D.__name__ = "Document"
+        self.assertEqual(media_true_type(D()), "video")
+
+    def test_document_with_audio_mime(self):
+        class D:
+            mime_type = "audio/mpeg"
+        D.__name__ = "Document"
+        self.assertEqual(media_true_type(D()), "audio")
+
+    def test_real_document_stays_document(self):
+        class D:
+            mime_type = "application/pdf"
+        D.__name__ = "Document"
+        self.assertEqual(media_true_type(D()), "document")
+
+    def test_image_document_stays_document(self):
+        """jpg/gif document ko jaan-boojhkar document hi rehne dete hain."""
+        for mime in ("image/jpeg", "image/png", "image/gif"):
+            class D:
+                mime_type = mime
+            D.__name__ = "Document"
+            self.assertEqual(media_true_type(D()), "document")
+
+    def test_document_without_mime(self):
+        class D:
+            mime_type = None
+        D.__name__ = "Document"
+        self.assertEqual(media_true_type(D()), "document")
+
+    def test_uppercase_mime(self):
+        class D:
+            mime_type = "VIDEO/MP4"
+        D.__name__ = "Document"
+        self.assertEqual(media_true_type(D()), "video")
+
+
+class TestApplyMediaMetaUpdateTypeFix(unittest.TestCase):
+    """Migration ke waqt galat file_type bhi theek hona chahiye."""
+
+    def _run(self, media, current_type):
+        import asyncio
+        import database.ia_filterdb as fdb
+
+        writes = []
+
+        class FakeCol:
+            async def update_one(self, flt, payload, **k):
+                writes.append((flt, payload))
+
+        asyncio.run(fdb.apply_media_meta_update(FakeCol(), "FID", media, current_type))
+        return writes[0][1]
+
+    def test_document_with_video_mime_gets_video_type(self):
+        class D:
+            width = 0
+            height = 0
+            mime_type = "video/mp4"
+        D.__name__ = "Document"
+
+        payload = self._run(D(), "document")
+        self.assertEqual(payload["$set"]["file_type"], "video")
+        self.assertEqual(payload["$set"]["meta.mime"], "video/mp4")
+        # Document par duration/width/height attribute hi nahi — likha hi nahi jaata
+        self.assertNotIn("duration", payload["$set"])
+        self.assertEqual(payload["$set"]["meta.w"], 0)
+        self.assertEqual(payload["$unset"], {"meta.err": ""})
+
+    def test_correct_type_not_rewritten(self):
+        class V:
+            width = 1920
+            height = 1080
+            mime_type = "video/mp4"
+            duration = 120
+        V.__name__ = "Video"
+
+        payload = self._run(V(), "video")
+        self.assertNotIn("file_type", payload["$set"])
+        self.assertEqual(payload["$set"]["duration"], 120)
+
+    def test_animation_not_touched(self):
+        class A:
+            width = 500
+            height = 500
+            mime_type = "video/mp4"
+            duration = 5
+        A.__name__ = "Animation"
+
+        payload = self._run(A(), "animation")
+        self.assertNotIn("file_type", payload["$set"])
+
+
+class TestApplyMediaMetaUpdate(unittest.TestCase):
+    """Migration ka DB write — duration/meta dotted keys se."""
+
+    def _run(self, media):
+        import asyncio
+        from unittest import mock
+        import database.ia_filterdb as fdb
+
+        writes = []
+
+        class FakeCol:
+            async def update_one(self, flt, payload, **k):
+                writes.append((flt, payload))
+
+        meta = asyncio.run(fdb.apply_media_meta_update(FakeCol(), "FID", media))
+        return writes, meta
+
+    def test_writes_all_fields_as_dotted_keys(self):
+        class FakeVideo:
+            width = 1920
+            height = 1080
+            mime_type = "video/x-matroska"
+            duration = 7260
+
+        writes, meta = self._run(FakeVideo())
+        flt, payload = writes[0]
+        self.assertEqual(flt, {"_id": "FID"})
+        self.assertEqual(payload["$set"]["duration"], 7260)
+        self.assertEqual(payload["$set"]["meta.w"], 1920)
+        self.assertEqual(payload["$set"]["meta.h"], 1080)
+        self.assertEqual(payload["$set"]["meta.mime"], "video/x-matroska")
+        self.assertEqual(payload["$set"]["meta.v"], 1)
+        self.assertNotIn("meta", payload["$set"], "dotted keys honi chahiye")
+        self.assertEqual(payload["$unset"], {"meta.err": ""})
+        self.assertEqual(meta, {"v": 1, "w": 1920, "h": 1080, "mime": "video/x-matroska"})
+
+    def test_document_keeps_zero_duration(self):
+        """Document par duration attribute hi nahi — 0 overwrite nahi honi chahiye."""
+        class FakeDoc:
+            width = 0
+            height = 0
+            mime_type = "application/pdf"
+
+        writes, _ = self._run(FakeDoc())
+        payload = writes[0][1]
+        self.assertNotIn("duration", payload["$set"])
+        self.assertEqual(payload["$set"]["meta.mime"], "application/pdf")
+
+    def test_media_without_duration_attribute(self):
+        class Weird:
+            width = 640
+            height = 480
+            mime_type = "video/mp4"
+
+        writes, _ = self._run(Weird())
+        self.assertNotIn("duration", writes[0][1]["$set"])
+
+
+class TestMigrationPlugin(unittest.TestCase):
+    """/migrate_meta command aur uska engine registered hona chahiye."""
+
+    def test_command_handler_registered(self):
+        import plugins.meta_migrate as mm
+        self.assertTrue(callable(mm.migrate_meta_cmd))
+        self.assertTrue(callable(mm.migrate_meta_cancel))
+        self.assertTrue(callable(mm.start_meta_migration))
+
+    def test_command_listed_in_help(self):
+        from Script import script
+        self.assertIn("/migrate_meta", script.ADMIN_COMMAND_TXT)
+
+    def test_ui_has_all_counters(self):
+        from plugins.meta_migrate import get_migration_ui
+        ui = get_migration_ui(50, 100, 40, 5, 5, 60, 60, 50, type_fixed=7)
+        for token in ("40", "50", "100", "Filled", "Skipped", "Failed", "Type Fixed", "7"):
+            self.assertIn(token, ui)
+
+
+class TestIndexTimeTypeGuard(unittest.TestCase):
+    """Index-time par wahi gadbad dobara na ho: video/audio file par galti se
+    'document' likh diya jata tha. `save_file` ko media_true_type use karna chahiye."""
+
+    def test_save_file_uses_true_type(self):
+        import database.ia_filterdb as fdb
+        self.assertIn("media_true_type", fdb.save_file.__code__.co_names)
+
+    def test_save_file_does_not_use_raw_class_name(self):
+        """`type(media).__name__.lower()` seedha nahi hona chahiye."""
+        import database.ia_filterdb as fdb
+        src = inspect.getsource(fdb.save_file)
+        self.assertNotIn("type(media).__name__.lower()", src)
+
+
+def _fake_media(type_name, **attrs):
+    """Telegram jaisa fake media object — `type(m).__name__` == type_name.
+
+    (class body me `__name__ = ...` kaam nahi karta: `type.__name__` metaclass
+    par data-descriptor hai, isliye class-dict entry ko shadow kar deta hai.)
+    """
+    return type(type_name, (), attrs)()
+
+
+def _video(w=1920, h=1080, dur=7260, mime="video/x-matroska"):
+    """Telegram par ASLI VIDEO — duration/width/height/mime sab hota hai."""
+    return _fake_media("Video", width=w, height=h, duration=dur,
+                       mime_type=mime, file_size=10 ** 8)
+
+
+def _document(mime="application/pdf"):
+    return _fake_media("Document", mime_type=mime, file_size=10 ** 7)
+
+
+def _audio(dur=245, mime="audio/mpeg"):
+    return _fake_media("Audio", duration=dur, mime_type=mime, file_size=10 ** 7)
+
+
+class TestWrongFileTypeRepair(unittest.TestCase):
+    """⭐ ASLI BUG: file Telegram par VIDEO hai (play bhi hoti hai), par purane
+    code ke bug se DB me `file_type: "document"` likh gaya tha. Migration ko
+    type + duration + w + h + mime — sab theek karna chahiye, bina re-index."""
+
+    def _apply(self, doc, media):
+        import asyncio
+        import database.ia_filterdb as fdb
+
+        writes = []
+
+        class FakeCol:
+            async def update_one(self, flt, payload, **k):
+                writes.append((flt, payload))
+
+        asyncio.run(fdb.apply_media_meta_update(
+            FakeCol(), doc["_id"], media, current_type=doc.get("file_type")))
+        return writes[0][1]
+
+    def test_document_labelled_video_gets_full_fix(self):
+        doc = {"_id": "F1", "file_type": "document", "file_ref": "V1"}
+        payload = self._apply(doc, _video())
+
+        self.assertEqual(payload["$set"]["file_type"], "video")
+        self.assertEqual(payload["$set"]["duration"], 7260)
+        self.assertEqual(payload["$set"]["meta.w"], 1920)
+        self.assertEqual(payload["$set"]["meta.h"], 1080)
+        self.assertEqual(payload["$set"]["meta.mime"], "video/x-matroska")
+        self.assertEqual(payload["$unset"], {"meta.err": ""})
+
+    def test_already_migrated_wrong_type_only_type_written(self):
+        """Pehle wale migration run me meta/duration bhul chuke the, sirf type galat."""
+        doc = {"_id": "F2", "file_type": "document", "duration": 7260,
+               "meta": {"v": 1, "w": 1920, "h": 1080, "mime": "video/x-matroska"}}
+        payload = self._apply(doc, _video())
+        self.assertEqual(payload["$set"]["file_type"], "video")
+        # baaki sab wapas wahi value — koi data nahi mitta
+        self.assertEqual(payload["$set"]["meta.w"], 1920)
+        self.assertEqual(payload["$set"]["duration"], 7260)
+
+    def test_mp4_video(self):
+        doc = {"_id": "F3", "file_type": "document"}
+        payload = self._apply(doc, _video(1280, 720, 3600, "video/mp4"))
+        self.assertEqual(payload["$set"]["file_type"], "video")
+        self.assertEqual(payload["$set"]["meta.mime"], "video/mp4")
+        self.assertEqual(payload["$set"]["duration"], 3600)
+
+    def test_wrongly_labelled_audio(self):
+        doc = {"_id": "F4", "file_type": "document"}
+
+        payload = self._apply(doc, _audio())
+        self.assertEqual(payload["$set"]["file_type"], "audio")
+        self.assertEqual(payload["$set"]["duration"], 245)
+
+    def test_real_document_type_untouched(self):
+        doc = {"_id": "F5", "file_type": "document"}
+        payload = self._apply(doc, _document())
+        self.assertNotIn("file_type", payload["$set"])
+        self.assertEqual(payload["$set"]["meta.mime"], "application/pdf")
+
+    def test_correct_video_type_untouched(self):
+        doc = {"_id": "F6", "file_type": "video"}
+        payload = self._apply(doc, _video())
+        self.assertNotIn("file_type", payload["$set"])
+        self.assertEqual(payload["$set"]["duration"], 7260)
+
+
+class TestMigrationThrottle(unittest.TestCase):
+    """User ka instruction: per-file gap 1-3s — na flood-wait lage, na spam-report."""
+
+    def test_gap_is_between_1_and_3_seconds(self):
+        import plugins.meta_migrate as mm
+        consts = mm.start_meta_migration.__code__.co_consts
+        self.assertIn(1.0, consts)
+        self.assertIn(3.0, consts)
+        self.assertNotIn(0.6, consts)
+        self.assertNotIn(1.2, consts)
 
 
 if __name__ == "__main__":

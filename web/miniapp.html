@@ -86,7 +86,10 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--txt);min-
 .sc{background:rgba(0,0,0,.6);backdrop-filter:blur(8px);color:#e0e0e0;border-radius:5px;padding:2px 7px;font-size:10px;font-weight:600;border:1px solid rgba(255,255,255,.08)}
 /* ⏱️ video duration chips */
 .dc{background:rgba(0,0,0,.75);backdrop-filter:blur(8px);color:#fff;border-radius:5px;padding:2px 7px;font-size:10px;font-weight:700;letter-spacing:.3px;border:1px solid rgba(255,255,255,.14);font-variant-numeric:tabular-nums}
+/* 🖼️ resolution chip — 1280×720 → "720p", 1920×1080 → "1080p" (khali to banta hi nahi) */
+.rc{background:rgba(0,0,0,.75);backdrop-filter:blur(8px);color:#ffd166;border-radius:5px;padding:2px 7px;font-size:10px;font-weight:800;letter-spacing:.3px;border:1px solid rgba(255,209,102,.35)}
 .td{color:var(--mu);font-size:11px;font-weight:600;font-variant-numeric:tabular-nums}
+.tr{color:#ffd166;font-size:11px;font-weight:800}
 .sp{margin-left:auto;border-radius:20px;padding:2px 8px;font-size:9px;font-weight:700;letter-spacing:.4px;display:inline-flex;align-items:center;gap:4px}
 .sp.primary{background:#14532d;color:#4ade80;border:1px solid #22c55e}
 .sp.cloud{background:#1e3a5f;color:#93c5fd;border:1px solid #60a5fa}
@@ -373,9 +376,12 @@ async function doSearch(off,allowEmpty){
          tab chip banta hi nahi, "0:00" jaisa bekaar text nahi dikhta. */
       let dc=f.duration?`<span class="dc">${esc(f.duration)}</span>`:'';
       let td=f.duration?`<span class="td">${esc(f.duration)}</span>`:'';
+      /* 🖼️ resolution chip — 1280×720 → "720p", 1920×1080 → "1080p"; khali to nahi banta */
+      let rc=f.res?`<span class="rc">${esc(f.res)}</span>`:'';
+      let tr=f.res?`<span class="tr">${esc(f.res)}</span>`:'';
       let ph=pMode!=='none'
-        ?`<div class="pb" id="pb-${f.file_id}"><img src="${f.tg_thumb}" class="fp" loading="lazy" onload="this.classList.add('on')" onerror="thumbErr('${f.file_id}')"><div class="pt"><span class="tc">${esc(f.type||'VIDEO')}</span><span class="sc">${esc(f.size||'')}</span>${dc}<span class="sp ${sc}"><span class="sd"></span>${sc.toUpperCase()}</span></div></div>`
-        :`<div class="ti"><span class="tt">${esc(f.type||'VIDEO')}</span><span class="ts">${esc(f.size||'')}</span>${td}<span class="tp ${sc}"><span class="sd"></span>${sc.toUpperCase()}</span></div>`;
+        ?`<div class="pb" id="pb-${f.file_id}"><img src="${f.tg_thumb}" class="fp" loading="lazy" onload="this.classList.add('on')" onerror="thumbErr('${f.file_id}')"><div class="pt"><span class="tc">${esc(f.type||'VIDEO')}</span><span class="sc">${esc(f.size||'')}</span>${dc}${rc}<span class="sp ${sc}"><span class="sd"></span>${sc.toUpperCase()}</span></div></div>`
+        :`<div class="ti"><span class="tt">${esc(f.type||'VIDEO')}</span><span class="ts">${esc(f.size||'')}</span>${td}${tr}<span class="tp ${sc}"><span class="sd"></span>${sc.toUpperCase()}</span></div>`;
       h+=`<div class="fc ce" onclick="openStream('${f.file_id}','${f.name.replace(/'/g,"\\'").replace(/`/g,'\\`')}')">${ph}<div class="fb"><div class="fn">${esc(f.name)}</div></div></div>`;
     });
     let res=Q1('#results');res.innerHTML=h;stagger(res);
