@@ -823,7 +823,7 @@ class TestMediaMetaCapture(unittest.TestCase):
     """
 
     def test_build_media_meta_from_video(self):
-        from database.ia_filterdb import build_media_meta
+        from database.ia_filterdb import build_media_meta, META_SCHEMA_VERSION
 
         class FakeVideo:
             width = 1920
@@ -834,7 +834,7 @@ class TestMediaMetaCapture(unittest.TestCase):
         self.assertEqual(meta["w"], 1920)
         self.assertEqual(meta["h"], 1080)
         self.assertEqual(meta["mime"], "video/mp4")
-        self.assertEqual(meta["v"], 1)
+        self.assertEqual(meta["v"], META_SCHEMA_VERSION)
 
     def test_build_media_meta_document_has_no_dimensions(self):
         """Document par width/height attribute hota hi nahi — crash nahi hona chahiye."""
@@ -958,9 +958,11 @@ class TestMediaMetaBackfill(unittest.TestCase):
         return writes
 
     def test_backfills_when_missing(self):
+        from database.ia_filterdb import META_SCHEMA_VERSION
         writes = self._run({"_id": "FID"})
         self.assertEqual(writes, [{"$set": {
-            "meta.v": 1, "meta.w": 1920, "meta.h": 1080, "meta.mime": "video/x-matroska"
+            "meta.v": META_SCHEMA_VERSION, "meta.w": 1920, "meta.h": 1080,
+            "meta.mime": "video/x-matroska"
         }}])
 
     def test_skips_when_already_present(self):
@@ -1347,30 +1349,35 @@ class TestMetaMigrationQuery(unittest.TestCase):
 
     def test_real_document_not_matched(self):
         """Asli document (pdf/jpg) ko chhedna nahi — wo dobara na ute."""
+        from database.ia_filterdb import META_SCHEMA_VERSION as V
         for mime in ("application/pdf", "image/jpeg", "image/gif", ""):
-            doc = {"file_type": "document", "meta": {"v": 1, "mime": mime}}
+            doc = {"file_type": "document", "meta": {"v": V, "mime": mime}}
             self.assertFalse(_doc_matches(build_q(), doc), mime)
 
     def test_already_fixed_video_not_matched(self):
         """Type theek ho chuka (video) aur meta bhi hai — dobara na uthe."""
-        doc = {"file_type": "video", "duration": 0, "meta": {"v": 1, "mime": "video/mp4"}}
+        from database.ia_filterdb import META_SCHEMA_VERSION as V
+        doc = {"file_type": "video", "duration": 0, "meta": {"v": V, "mime": "video/mp4"}}
         self.assertFalse(_doc_matches(build_q(), doc))
 
     def test_video_with_meta_but_zero_duration_not_matched(self):
         """Document object par duration attribute hi nahi — retry karne se kuch
         nahi milega, isliye aisa doc dobara nahi uthta (infinite loop se bachne ke liye)."""
-        doc = {"file_type": "video", "duration": 0, "meta": {"v": 1, "w": 1920, "h": 1080}}
+        from database.ia_filterdb import META_SCHEMA_VERSION as V
+        doc = {"file_type": "video", "duration": 0, "meta": {"v": V, "w": 1920, "h": 1080}}
         self.assertFalse(_doc_matches(build_q(), doc))
 
     def test_complete_video_not_matched(self):
+        from database.ia_filterdb import META_SCHEMA_VERSION as V
         doc = {"file_type": "video", "duration": 7260,
-               "meta": {"v": 1, "w": 1920, "h": 1080, "mime": "video/mp4"}}
+               "meta": {"v": V, "w": 1920, "h": 1080, "mime": "video/mp4"}}
         self.assertFalse(_doc_matches(build_q(), doc))
 
     def test_documents_not_matched_forever(self):
         """Documents ki duration legitimately 0 hoti hai — wo har run me na ute."""
+        from database.ia_filterdb import META_SCHEMA_VERSION as V
         doc = {"file_type": "document", "duration": 0,
-               "meta": {"v": 1, "w": 0, "h": 0, "mime": "application/pdf"}}
+               "meta": {"v": V, "w": 0, "h": 0, "mime": "application/pdf"}}
         self.assertFalse(_doc_matches(build_q(), doc))
 
     def test_document_without_meta_is_matched(self):
@@ -1523,6 +1530,7 @@ class TestApplyMediaMetaUpdate(unittest.TestCase):
             mime_type = "video/x-matroska"
             duration = 7260
 
+        from database.ia_filterdb import META_SCHEMA_VERSION as V
         writes, meta = self._run(FakeVideo())
         flt, payload = writes[0]
         self.assertEqual(flt, {"_id": "FID"})
@@ -1530,10 +1538,10 @@ class TestApplyMediaMetaUpdate(unittest.TestCase):
         self.assertEqual(payload["$set"]["meta.w"], 1920)
         self.assertEqual(payload["$set"]["meta.h"], 1080)
         self.assertEqual(payload["$set"]["meta.mime"], "video/x-matroska")
-        self.assertEqual(payload["$set"]["meta.v"], 1)
+        self.assertEqual(payload["$set"]["meta.v"], V)
         self.assertNotIn("meta", payload["$set"], "dotted keys honi chahiye")
         self.assertEqual(payload["$unset"], {"meta.err": ""})
-        self.assertEqual(meta, {"v": 1, "w": 1920, "h": 1080, "mime": "video/x-matroska"})
+        self.assertEqual(meta, {"v": V, "w": 1920, "h": 1080, "mime": "video/x-matroska"})
 
     def test_document_keeps_zero_duration(self):
         """Document par duration attribute hi nahi — 0 overwrite nahi honi chahiye."""
@@ -1692,6 +1700,616 @@ class TestMigrationThrottle(unittest.TestCase):
         self.assertIn(3.0, consts)
         self.assertNotIn(0.6, consts)
         self.assertNotIn(1.2, consts)
+
+
+# ─────────────────────────────────────────────
+# 🔍 TRUE MEDIA PROBE (bug: sab par 1280×720)
+# Telegram attributes uploader ke likhe hote hain (aksar default 1280×720),
+# isliye asli w/h/duration file BYTES (container header) se nikalte hain.
+# Neeche byte-fixtures se pure parsers test hote hain (network nahi).
+# ─────────────────────────────────────────────
+def _mp4_box(typ, payload):
+    import struct
+    return struct.pack(">I", 8 + len(payload)) + typ + payload
+
+
+def _mp4_tkhd(w, h, ver=0, rotate90=False):
+    import struct
+    head = bytes([ver, 0, 0, 0]) + b"\x00" * (32 if ver == 1 else 20)
+    head += b"\x00" * 8  # reserved
+    head += struct.pack(">HHhH", 0, 0, 0x0100, 0)  # layer/alt/volume/reserved
+    a, b, c, d = (0, 65536, -65536, 0) if rotate90 else (65536, 0, 0, 65536)
+    head += struct.pack(">iiiiiiiii", a, b, 0, c, d, 0, 0, 0, 1 << 30)
+    head += struct.pack(">II", w * 65536, h * 65536)
+    return head
+
+
+def _mp4_mvhd(ts, dur, ver=0):
+    import struct
+    if ver == 1:
+        return bytes([1, 0, 0, 0]) + b"\x00" * 16 + struct.pack(">IQ", ts, dur)
+    return bytes([0, 0, 0, 0]) + b"\x00" * 8 + struct.pack(">II", ts, dur)
+
+
+def _mp4_hdlr(handler=b"vide"):
+    return b"\x00" * 8 + handler + b"\x00" * 12 + b"Handler\x00"
+
+
+def _mp4_trak(w, h, handler=b"vide", tkhd_ver=0, rotate90=False):
+    mdia = _mp4_box(b"mdia", _mp4_box(b"mdhd", b"\x00" * 32)
+                    + _mp4_box(b"hdlr", _mp4_hdlr(handler))
+                    + _mp4_box(b"minf", b"\x00" * 16))
+    return _mp4_box(b"trak", _mp4_box(b"tkhd", _mp4_tkhd(w, h, tkhd_ver, rotate90)) + mdia)
+
+
+def _mp4_moov(w=1920, h=1080, ts=90000, dur=6480000, audio_first=False):
+    traks = b""
+    if audio_first:
+        traks += _mp4_trak(0, 0, handler=b"soun")
+    traks += _mp4_trak(w, h)
+    return _mp4_box(b"moov", _mp4_box(b"mvhd", _mp4_mvhd(ts, dur)) + traks)
+
+
+def _mp4_ftyp():
+    return _mp4_box(b"ftyp", b"isom\x00\x00\x00\x01isomiso2mp41")
+
+
+def _ebml_size(n):
+    for ln in range(1, 9):
+        if n < (1 << (7 * ln)) - 1:
+            raw = n.to_bytes(ln, "big")
+            return bytes([raw[0] | (0x80 >> (ln - 1))]) + raw[1:]
+    raise ValueError("too big")
+
+
+def _ebml_el(eid, payload):
+    return eid + _ebml_size(len(payload)) + payload
+
+
+def _ebml_uint(n):
+    return n.to_bytes(max(1, (n.bit_length() + 7) // 8), "big")
+
+
+def _mkv_fixture(pw=1920, ph=800, dur=7200.0, display=None,
+                 second_video=False, audio_track=False):
+    # NOTE: `dur` seconds me hai; raw Duration element = sec*1e9/scale (scale=1e6)
+    import struct
+    video = _ebml_el(b"\xb0", _ebml_uint(pw)) + _ebml_el(b"\xba", _ebml_uint(ph))
+    if display:
+        video += (_ebml_el(b"\x54\xb0", _ebml_uint(display[0]))
+                  + _ebml_el(b"\x54\xba", _ebml_uint(display[1])))
+    tracks = _ebml_el(b"\xae", _ebml_el(b"\xd7", b"\x01")
+                       + _ebml_el(b"\x83", b"\x01") + _ebml_el(b"\xe0", video))
+    if second_video:
+        v2 = _ebml_el(b"\xe0", _ebml_el(b"\xb0", _ebml_uint(640))
+                       + _ebml_el(b"\xba", _ebml_uint(480)))
+        tracks += _ebml_el(b"\xae", _ebml_el(b"\xd7", b"\x02")
+                            + _ebml_el(b"\x83", b"\x01") + v2)
+    if audio_track:
+        tracks += _ebml_el(b"\xae", _ebml_el(b"\xd7", b"\x03")
+                            + _ebml_el(b"\x83", b"\x02") + _ebml_el(b"\xe1", b"\x00" * 8))
+    info = (_ebml_el(b"\x2a\xd7\xb1", _ebml_uint(1000000))
+            + _ebml_el(b"\x44\x89", struct.pack(">d", dur * 1000.0)))
+    seg = _ebml_el(b"\x15\x49\xa9\x66", info) + _ebml_el(b"\x16\x54\xae\x6b", tracks)
+    seg_full = b"\x18\x53\x80\x67" + b"\xff" + seg  # Segment, unknown size (typical)
+    return _ebml_el(b"\x1a\x45\xdf\xa3", _ebml_el(b"\x42\x86", b"\x01")) + seg_full
+
+
+def _riff_chunk(cid, payload):
+    import struct
+    out = cid + struct.pack("<I", len(payload)) + payload
+    if len(payload) & 1:
+        out += b"\x00"
+    return out
+
+
+def _riff_list(ltype, inner):
+    import struct
+    body = ltype + inner
+    return b"LIST" + struct.pack("<I", len(body)) + body
+
+
+def _avi_fixture(w=1280, h=720, mspf=40000, frames=1800,
+                 audio=True, neg_h=False):
+    import struct
+    avih = struct.pack("<IIIIIIIIIIIIII", mspf, 0, 0, 0x10, frames, 0, 2,
+                       0, w, h, 0, 0, 0, 0)
+    strf_v = struct.pack("<IiiHHIIIIII", 40, w, -h if neg_h else h,
+                         1, 24, 0, 0, 0, 0, 0, 0)
+    inner = (_riff_chunk(b"avih", avih)
+             + _riff_list(b"strl", _riff_chunk(b"strh", b"vids" + b"\x00" * 52)
+                          + _riff_chunk(b"strf", strf_v)))
+    if audio:
+        strf_a = bytes.fromhex("0100020044ac000010b1020004001000")
+        inner += _riff_list(b"strl", _riff_chunk(b"strh", b"auds" + b"\x00" * 52)
+                            + _riff_chunk(b"strf", strf_a))
+    hdrl = _riff_list(b"hdrl", inner)
+    movi = _riff_list(b"movi", b"\x00" * 64)  # frames — parser ise skip kare
+    body = b"AVI " + hdrl + movi
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+class TestProbeMP4(unittest.TestCase):
+    """MP4/MOV: moov → mvhd (duration) + video trak → tkhd (w/h)."""
+
+    def test_faststart_head(self):
+        from media_probe import parse_mp4
+        head = _mp4_ftyp() + _mp4_moov() + _mp4_box(b"mdat", b"\x00" * 200)
+        w, h, dur = parse_mp4(head)
+        self.assertEqual((w, h), (1920, 1080))
+        self.assertAlmostEqual(dur, 72.0)  # 6480000/90000
+
+    def test_audio_trak_first_still_finds_video(self):
+        from media_probe import parse_mp4
+        head = _mp4_ftyp() + _mp4_moov(audio_first=True)
+        w, h, _ = parse_mp4(head)
+        self.assertEqual((w, h), (1920, 1080))
+
+    def test_v1_boxes(self):
+        from media_probe import parse_mp4
+        trak = _mp4_trak(3840, 2160, tkhd_ver=1)
+        moov = _mp4_box(b"moov", _mp4_box(b"mvhd", _mp4_mvhd(1000, 3600000, ver=1)) + trak)
+        w, h, dur = parse_mp4(_mp4_ftyp() + moov)
+        self.assertEqual((w, h), (3840, 2160))
+        self.assertAlmostEqual(dur, 3600.0)
+
+    def test_rotated_video_gives_display_dims(self):
+        """90° rotated clip (portrait): tkhd coded 1920×1080 → display 1080×1920."""
+        from media_probe import parse_mp4
+        trak = _mp4_trak(1920, 1080, rotate90=True)
+        moov = _mp4_box(b"moov", _mp4_box(b"mvhd", _mp4_mvhd(90000, 90000)) + trak)
+        w, h, _ = parse_mp4(_mp4_ftyp() + moov)
+        self.assertEqual((w, h), (1080, 1920))
+
+    def test_moov_at_end_head_has_nothing(self):
+        """moov-at-end file ka head sirf ftyp+mdat rakhta hai → (0,0,None)."""
+        import struct
+        from media_probe import parse_mp4
+        head = _mp4_ftyp() + struct.pack(">I", 0x7FFFFFFF) + b"mdat" + b"\x00" * 500
+        self.assertEqual(parse_mp4(head), (0, 0, None))
+
+    def test_garbage_never_raises(self):
+        from media_probe import parse_mp4
+        for bad in (b"", b"\x00" * 10, b"RIFF....AVI ", b"\xff" * 100,
+                    _mp4_ftyp()[:10]):
+            self.assertEqual(parse_mp4(bad), (0, 0, None))
+
+
+class TestProbeMP4Tail(unittest.TestCase):
+    """moov-at-end: tail bytes me moov scan + validation."""
+
+    def test_finds_moov_in_tail(self):
+        from media_probe import parse_mp4_tail
+        tail = b"\x00" * 1000 + _mp4_moov(1920, 800) + b"\x00" * 100
+        w, h, dur = parse_mp4_tail(tail)
+        self.assertEqual((w, h), (1920, 800))
+        self.assertAlmostEqual(dur, 72.0)
+
+    def test_skips_false_moov_in_mdat(self):
+        """mdat-data me 'moov' bytes milenge — invalid size wala skip ho."""
+        from media_probe import parse_mp4_tail
+        fake = b"\x00" * 500 + b"moov" + b"\x00" * 500  # size bytes = 0 → invalid
+        tail = fake + _mp4_moov(1280, 536)
+        w, h, _ = parse_mp4_tail(tail)
+        self.assertEqual((w, h), (1280, 536))
+
+    def test_no_moov_returns_empty(self):
+        from media_probe import parse_mp4_tail
+        self.assertEqual(parse_mp4_tail(b"\x00" * 5000), (0, 0, None))
+        self.assertEqual(parse_mp4_tail(b"short"), (0, 0, None))
+
+
+class TestProbeMKV(unittest.TestCase):
+    """MKV/WebM: EBML Segment → Tracks → PixelWidth/Height + Info Duration."""
+
+    def test_scope_movie(self):
+        from media_probe import parse_mkv
+        w, h, dur = parse_mkv(_mkv_fixture())
+        self.assertEqual((w, h), (1920, 800))
+        self.assertAlmostEqual(dur, 7200.0)
+
+    def test_display_dims_win_over_pixel(self):
+        """Anamorphic: Pixel 1440×1080 par Display 1920×1080 → display sach hai."""
+        from media_probe import parse_mkv
+        w, h, _ = parse_mkv(_mkv_fixture(pw=1440, ph=1080, display=(1920, 1080)))
+        self.assertEqual((w, h), (1920, 1080))
+
+    def test_first_video_track_wins(self):
+        from media_probe import parse_mkv
+        w, h, _ = parse_mkv(_mkv_fixture(second_video=True, audio_track=True))
+        self.assertEqual((w, h), (1920, 800))
+
+    def test_truncated_buffer_safe(self):
+        from media_probe import parse_mkv
+        full = _mkv_fixture()
+        for cut in (10, 40, 80, len(full) - 5):
+            w, h, dur = parse_mkv(full[:cut])  # raise nahi hona chahiye
+            self.assertIsInstance(w, int)
+            self.assertIsInstance(h, int)
+
+    def test_non_ebml_rejected(self):
+        from media_probe import parse_mkv
+        self.assertEqual(parse_mkv(b"RIFF" + b"\x00" * 100), (0, 0, None))
+        self.assertEqual(parse_mkv(b""), (0, 0, None))
+
+
+class TestProbeAVI(unittest.TestCase):
+    """AVI: hdrl → vids strf (BITMAPINFOHEADER) + avih duration."""
+
+    def test_basic(self):
+        from media_probe import parse_avi
+        w, h, dur = parse_avi(_avi_fixture())
+        self.assertEqual((w, h), (1280, 720))
+        self.assertAlmostEqual(dur, 72.0)  # 1800*40000/1e6
+
+    def test_negative_height_is_abs(self):
+        """top-down AVI me biHeight negative — dims same."""
+        from media_probe import parse_avi
+        w, h, _ = parse_avi(_avi_fixture(neg_h=True))
+        self.assertEqual((w, h), (1280, 720))
+
+    def test_garbage_safe(self):
+        from media_probe import parse_avi
+        self.assertEqual(parse_avi(b"RIFFgarbage"), (0, 0, None))
+        self.assertEqual(parse_avi(_avi_fixture()[:20]), (0, 0, None))
+
+
+class TestProbeDispatcher(unittest.TestCase):
+    """probe_bytes: magic dispatch + sanity bounds (DB me zehar nahi)."""
+
+    def test_mkv_dispatch(self):
+        from media_probe import probe_bytes
+        out = probe_bytes(_mkv_fixture())
+        self.assertEqual((out["w"], out["h"], out["duration"]), (1920, 800, 7200))
+
+    def test_mp4_faststart(self):
+        from media_probe import probe_bytes
+        out = probe_bytes(_mp4_ftyp() + _mp4_moov())
+        self.assertEqual((out["w"], out["h"], out["duration"]), (1920, 1080, 72))
+
+    def test_mp4_tail_fallback(self):
+        import struct
+        from media_probe import probe_bytes
+        head = _mp4_ftyp() + struct.pack(">I", 0x7FFFFFFF) + b"mdat" + b"\x00" * 500
+        tail = b"\x00" * 1000 + _mp4_moov(1920, 800)
+        out = probe_bytes(head, tail, "movie.mp4")
+        self.assertEqual((out["w"], out["h"]), (1920, 800))
+
+    def test_avi_dispatch(self):
+        from media_probe import probe_bytes
+        out = probe_bytes(_avi_fixture())
+        self.assertEqual((out["w"], out["h"], out["duration"]), (1280, 720, 72))
+
+    def test_pdf_and_garbage_give_empty(self):
+        from media_probe import probe_bytes
+        self.assertEqual(probe_bytes(b"%PDF-1.4 garbage" + b"\x00" * 100, None, "a.pdf"), {})
+        self.assertEqual(probe_bytes(b"\x00" * 5000), {})
+        self.assertEqual(probe_bytes(b"", None, "x.mkv"), {})
+        self.assertEqual(probe_bytes(None), {})
+
+    def test_insane_dims_dropped_duration_kept(self):
+        """Parser bug se 10000×10 aaye to dims drop (duration sahi ho to rakho)."""
+        from media_probe import probe_bytes
+        out = probe_bytes(_mp4_ftyp() + _mp4_moov(w=10000, h=10))
+        self.assertNotIn("w", out)
+        self.assertNotIn("h", out)
+        self.assertEqual(out.get("duration"), 72)
+
+    def test_extension_hint_only_for_video_exts(self):
+        from media_probe import probe_bytes
+        # unknown magic + non-video ext → bilkul koshish nahi
+        self.assertEqual(probe_bytes(b"ZZZZ" + b"\x00" * 5000, None, "a.pdf"), {})
+
+
+class TestShouldProbe(unittest.TestCase):
+    """Sirf video-ish media par bandwidth kharch ho (PDF/MP3 par nahi)."""
+
+    def test_video_objects(self):
+        from media_probe import should_probe_media
+        for t in ("Video", "Animation", "VideoNote"):
+            m = type(t, (), {})()
+            self.assertTrue(should_probe_media(m), t)
+
+    def test_document_with_video_mime_or_ext(self):
+        from media_probe import should_probe_media
+        d1 = type("Document", (), {"mime_type": "video/x-matroska"})()
+        self.assertTrue(should_probe_media(d1))
+        d2 = type("Document", (), {"mime_type": "", "file_name": "m.mkv"})()
+        self.assertTrue(should_probe_media(d2))
+        d3 = type("Document", (), {"mime_type": None})()
+        self.assertTrue(should_probe_media(d3, "Movie.mp4"))
+
+    def test_non_video_skipped(self):
+        from media_probe import should_probe_media
+        self.assertFalse(should_probe_media(None))
+        pdf = type("Document", (), {"mime_type": "application/pdf",
+                                    "file_name": "a.pdf"})()
+        self.assertFalse(should_probe_media(pdf))
+        audio = type("Audio", (), {"mime_type": "audio/mpeg"})()
+        self.assertFalse(should_probe_media(audio))
+        photo = type("Photo", (), {})()
+        self.assertFalse(should_probe_media(photo))
+
+
+class TestProbedOverride(unittest.TestCase):
+    """Probed (actual-bytes) values Telegram attributes ko override karein."""
+
+    def test_build_meta_prefers_probed(self):
+        from database.ia_filterdb import build_media_meta
+        v = type("Video", (), {"width": 1280, "height": 720,
+                               "mime_type": "video/mp4"})()
+        meta = build_media_meta(v, {"w": 1920, "h": 1080})
+        self.assertEqual((meta["w"], meta["h"]), (1920, 1080))
+        self.assertEqual(meta["mime"], "video/mp4")
+
+    def test_build_meta_partial_probe_keeps_attrs(self):
+        """Adhoora probe (sirf w) attributes ko kharab na kare."""
+        from database.ia_filterdb import build_media_meta
+        v = type("Video", (), {"width": 1280, "height": 720,
+                               "mime_type": "video/mp4"})()
+        meta = build_media_meta(v, {"w": 1920})
+        self.assertEqual((meta["w"], meta["h"]), (1280, 720))
+        meta2 = build_media_meta(v, None)
+        self.assertEqual((meta2["w"], meta2["h"]), (1280, 720))
+
+    def test_apply_uses_probed_duration(self):
+        import asyncio
+        import database.ia_filterdb as fdb
+        writes = []
+
+        class FakeCol:
+            async def update_one(self, flt, payload, **k):
+                writes.append(payload)
+
+        v = type("Video", (), {"width": 1280, "height": 720, "duration": 100,
+                               "mime_type": "video/mp4"})()
+        asyncio.run(fdb.apply_media_meta_update(
+            FakeCol(), "FID", v, "video", {"w": 1920, "h": 1080, "duration": 7260}))
+        payload = writes[0]
+        self.assertEqual(payload["$set"]["duration"], 7260)
+        self.assertEqual(payload["$set"]["meta.w"], 1920)
+        self.assertEqual(payload["$set"]["meta.h"], 1080)
+
+    def test_apply_falls_back_to_attr_duration(self):
+        import asyncio
+        import database.ia_filterdb as fdb
+        writes = []
+
+        class FakeCol:
+            async def update_one(self, flt, payload, **k):
+                writes.append(payload)
+
+        v = type("Video", (), {"width": 1280, "height": 720, "duration": 120,
+                               "mime_type": "video/mp4"})()
+        asyncio.run(fdb.apply_media_meta_update(FakeCol(), "FID", v, "video", {}))
+        self.assertEqual(writes[0]["$set"]["duration"], 120)
+
+    def test_save_file_persists_probed(self):
+        import asyncio
+        from unittest import mock
+        import database.ia_filterdb as fdb
+
+        class FakeVideo:
+            file_id = "CQADtest"
+            file_name = "Movie_1080p.mkv"
+            caption = None
+            file_size = 12345
+            duration = 100  # jhootha attribute
+            width = 1280
+            height = 720
+            mime_type = "video/x-matroska"
+
+        captured = {}
+
+        class FakeCol:
+            async def find_one(self, *a, **k):
+                return None
+
+            async def update_one(self, flt, payload, **k):
+                captured.update(payload)
+
+        with mock.patch.object(fdb, "unpack_new_file_id", return_value="ABC123"), \
+             mock.patch.object(fdb, "COLLECTIONS", {"primary": FakeCol()}):
+            result = asyncio.run(fdb.save_file(
+                FakeVideo(), "primary", {"w": 1920, "h": 1080, "duration": 7260}))
+        self.assertEqual(result, "suc")
+        self.assertEqual(captured["$set"]["meta.w"], 1920)
+        self.assertEqual(captured["$set"]["meta.h"], 1080)
+        self.assertEqual(captured["$set"]["duration"], 7260)
+
+
+class _FakeFileClient:
+    """hydrogram Client ka range-download hissa (get_file async-generator)."""
+
+    def __init__(self, head_chunks, tail_chunks=()):
+        self.head_chunks = list(head_chunks)
+        self.tail_chunks = list(tail_chunks)
+        self.calls = []
+
+    async def get_file(self, fid, file_size=0, limit=0, offset=0,
+                       progress=None, progress_args=()):
+        self.calls.append((offset, limit))
+        chunks = self.tail_chunks if offset > 0 else self.head_chunks
+        for c in chunks[:limit or len(chunks)]:
+            yield c
+
+
+class TestProbeTelegramFile(unittest.TestCase):
+    """Orchestrator: head → parsers → (mp4: tail) → ffprobe. Network mocked."""
+
+    def _run(self, client, file_size=0, file_name="m.mkv"):
+        import asyncio
+        from unittest import mock
+        from media_probe import probe_telegram_file
+        with mock.patch("hydrogram.file_id.FileId.decode", return_value=object()):
+            return asyncio.run(probe_telegram_file(
+                client, "REF", file_size=file_size, file_name=file_name))
+
+    def test_mkv_head_only_no_tail_fetch(self):
+        out = self._run(_FakeFileClient([_mkv_fixture()]), file_size=10 ** 9)
+        self.assertEqual((out["w"], out["h"], out["duration"]), (1920, 800, 7200))
+
+    def test_mp4_faststart_no_tail_fetch(self):
+        client = _FakeFileClient([_mp4_ftyp() + _mp4_moov()])
+        out = self._run(client, file_size=2 * 10 ** 9, file_name="m.mp4")
+        self.assertEqual((out["w"], out["h"]), (1920, 1080))
+        self.assertTrue(all(off == 0 for off, _ in client.calls),
+                        "moov head me mila to tail fetch bekaar hai")
+
+    def test_mp4_tail_fetched_when_needed(self):
+        import struct
+        head = _mp4_ftyp() + struct.pack(">I", 0x7FFFFFFF) + b"mdat" + b"\x00" * 500
+        tail = b"\x00" * 1000 + _mp4_moov(1920, 800)
+        client = _FakeFileClient([head], [tail])
+        out = self._run(client, file_size=100 * 1024 * 1024, file_name="m.mp4")
+        self.assertEqual((out["w"], out["h"]), (1920, 800))
+        self.assertTrue(any(off > 0 for off, _ in client.calls), "tail fetch hona chahiye")
+
+    def test_empty_fetch_gives_empty(self):
+        self.assertEqual(self._run(_FakeFileClient([])), {})
+
+    def test_no_client_no_ref_gives_empty(self):
+        import asyncio
+        from media_probe import probe_telegram_file
+        self.assertEqual(asyncio.run(probe_telegram_file(None, "REF")), {})
+        self.assertEqual(asyncio.run(probe_telegram_file(object(), "")), {})
+
+    def test_floodwait_propagates(self):
+        """Probe ka FloodWait dabana nahi — migration ka handler soyega."""
+        import asyncio
+        from unittest import mock
+        from hydrogram.errors import FloodWait
+        from media_probe import probe_telegram_file
+
+        class FloodClient:
+            async def get_file(self, *a, **k):
+                raise FloodWait(7)
+                yield b""  # async-generator banane ke liye (kabhi chalega nahi)
+
+        with mock.patch("hydrogram.file_id.FileId.decode", return_value=object()):
+            with self.assertRaises(FloodWait):
+                asyncio.run(probe_telegram_file(FloodClient(), "REF"))
+
+    def test_ffprobe_used_as_last_resort(self):
+        from unittest import mock
+        head = b"TSHEAD" + b"\x00" * 5000  # unknown magic
+        with mock.patch("media_probe.ffprobe_head", return_value={"w": 640, "h": 480}):
+            out = self._run(_FakeFileClient([head]), file_name="a.ts")
+        self.assertEqual((out["w"], out["h"]), (640, 480))
+
+
+class TestFfprobeFallback(unittest.TestCase):
+    """Rare containers (TS/FLV/...) ke liye ffprobe — best-effort, kabhi raise nahi."""
+
+    def test_parses_video_stream_and_rotation(self):
+        import json
+        from unittest import mock
+        from media_probe import ffprobe_head
+        payload = json.dumps({
+            "streams": [{"codec_type": "video", "width": 1920, "height": 1080,
+                         "tags": {"rotate": "90"}}],
+            "format": {"duration": "72.4"},
+        }).encode()
+        proc = mock.Mock(returncode=0, stdout=payload)
+        with mock.patch("media_probe.shutil.which", return_value="/usr/bin/ffprobe"), \
+             mock.patch("media_probe.subprocess.run", return_value=proc):
+            out = ffprobe_head(b"\x00" * 2048)
+        self.assertEqual((out["w"], out["h"]), (1080, 1920))  # rotate swap
+        self.assertEqual(out["duration"], 72)
+
+    def test_missing_binary_or_failure_gives_empty(self):
+        from unittest import mock
+        from media_probe import ffprobe_head
+        with mock.patch("media_probe.shutil.which", return_value=None):
+            self.assertEqual(ffprobe_head(b"\x00" * 2048), {})
+        proc = mock.Mock(returncode=1, stdout=b"")
+        with mock.patch("media_probe.shutil.which", return_value="/usr/bin/ffprobe"), \
+             mock.patch("media_probe.subprocess.run", return_value=proc):
+            self.assertEqual(ffprobe_head(b"\x00" * 2048), {})
+        self.assertEqual(ffprobe_head(b"tiny"), {})  # bahut chhota head
+
+
+class TestMigrationQueryV2(unittest.TestCase):
+    """v1 docs (Telegram-attrs wale) dobara uthenge — probe se sach likhega."""
+
+    def test_v1_complete_video_requeued(self):
+        doc = {"file_type": "video", "duration": 7260,
+               "meta": {"v": 1, "w": 1280, "h": 720, "mime": "video/mp4"}}
+        self.assertTrue(_doc_matches(build_q(), doc))
+
+    def test_v2_complete_video_skipped(self):
+        from database.ia_filterdb import META_SCHEMA_VERSION as V
+        doc = {"file_type": "video", "duration": 7260,
+               "meta": {"v": V, "w": 1920, "h": 1080, "mime": "video/mp4"}}
+        self.assertFalse(_doc_matches(build_q(), doc))
+
+    def test_v1_pdf_requeued_once_for_finalize(self):
+        doc = {"file_type": "document", "duration": 0,
+               "meta": {"v": 1, "w": 0, "h": 0, "mime": "application/pdf"}}
+        self.assertTrue(_doc_matches(build_q(), doc))
+
+    def test_v2_backfilled_doc_with_video_mime_still_matched(self):
+        """Backfill ne mime likha par type nahi — migration type+probe karega."""
+        from database.ia_filterdb import META_SCHEMA_VERSION as V
+        doc = {"file_type": "document",
+               "meta": {"v": V, "w": 0, "h": 0, "mime": "video/x-matroska"}}
+        self.assertTrue(_doc_matches(build_q(), doc))
+
+
+class TestBackfillProbe(unittest.TestCase):
+    """Lazy backfill bhi probe kare; probe-fail par meta.v na likhe (migration retry)."""
+
+    def _run(self, existing, probed_result="__noprobe__"):
+        import asyncio
+        from unittest import mock
+        from web.search_api import _backfill_media_meta
+        writes = []
+
+        class FakeCol:
+            async def update_one(self, flt, payload, **k):
+                writes.append(payload)
+
+        media = type("Video", (), {"width": 1280, "height": 720,
+                                   "mime_type": "video/mp4", "file_id": "REF123",
+                                   "file_name": "m.mkv", "file_size": 100})()
+        msg = mock.MagicMock()
+        msg.media = mock.MagicMock()
+        msg.media.value = "video"
+        msg.video = media
+        if probed_result == "__noprobe__":
+            # temp.BOT None (test env) → probe skip → {} (fail jaisa)
+            asyncio.run(_backfill_media_meta(FakeCol(), "FID", existing, msg))
+        else:
+            with mock.patch("web.search_api.probe_telegram_file",
+                            new=mock.AsyncMock(return_value=probed_result)):
+                asyncio.run(_backfill_media_meta(FakeCol(), "FID", existing, msg))
+        return writes
+
+    def test_probe_fail_writes_attrs_without_v(self):
+        writes = self._run({"_id": "FID"})
+        payload = writes[0]["$set"]
+        self.assertEqual(payload["meta.w"], 1280)  # UI ke liye attributes abhi
+        self.assertNotIn("meta.v", payload, "v nahi → migration dobara probe karega")
+
+    def test_probe_success_writes_v_and_corrects_duration(self):
+        from database.ia_filterdb import META_SCHEMA_VERSION as V
+        writes = self._run({"_id": "FID", "duration": 100},
+                           {"w": 1920, "h": 1080, "duration": 3600})
+        payload = writes[0]["$set"]
+        self.assertEqual(payload["meta.v"], V)
+        self.assertEqual(payload["meta.w"], 1920)
+        self.assertEqual(payload["meta.h"], 1080)
+        self.assertEqual(payload["duration"], 3600)
+
+
+class TestMigrationUIProbed(unittest.TestCase):
+    """Migration console me probe counter dikhe."""
+
+    def test_ui_has_probed_line(self):
+        from plugins.meta_migrate import get_migration_ui
+        ui = get_migration_ui(10, 100, 8, 1, 1, 5, 5, 5, type_fixed=2, probed=7)
+        self.assertIn("Probed", ui)
+        self.assertIn("7", ui)
 
 
 if __name__ == "__main__":

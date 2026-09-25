@@ -7,6 +7,7 @@ from hydrogram import Client, filters, enums
 from hydrogram.errors import FloodWait
 from info import ADMINS, LOG_CHANNEL
 from database.ia_filterdb import save_file
+from media_probe import probe_telegram_file, should_probe_media
 from hydrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from utils import temp, get_readable_time
 from Script import script
@@ -256,8 +257,27 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot, skip, collection_type="p
                         media.file_name = re.sub(r"@\w+|(_|\-|\.|\+)", " ", str(media.file_name)).strip()
                 except:
                     pass
-                
-                sts = await save_file(media, collection_type=collection_type)
+
+                # 🔍 Asli w/h/duration file BYTES se probe — nayi files me wahi
+                # 1280×720-default gadbad na aaye jo purani files me aayi thi
+                # (uploader ke Telegram attributes par bharosa nahi).
+                # Best-effort: fail ho to attributes use hote hain. Probe kabhi
+                # indexing nahi rokta — FloodWait bhi yahin dabta hai (warna ek
+                # flood par poora index cancel ho jaata, jo outer handler karta hai).
+                probed = {}
+                try:
+                    if should_probe_media(media, getattr(media, 'file_name', '') or ''):
+                        probed = await probe_telegram_file(
+                            bot, media.file_id,
+                            file_size=file_size or 0,
+                            file_name=str(getattr(media, 'file_name', '') or ''),
+                        )
+                except Exception as e:
+                    logger.debug(f"[INDEX] probe skipped: {str(e)[:80]}")
+                    probed = {}
+
+                sts = await save_file(media, collection_type=collection_type,
+                                      probed=probed or None)
                 
                 if sts == 'suc':
                     total_files += 1

@@ -174,15 +174,38 @@ async def get_post_category_counts():
 # aage se "1080p only", "mkv only", aspect-ratio jaise filter isi se banenge.
 # Document par width/height hota hi nahi (getattr se safe) aur mime_type kabhi
 # None bhi ho sakta hai, isliye dono ke liye sane default (0 / "") rakhe hain.
+#
+# ⚠️ v2 (2026-09-25, bug report: sab par 1280×720): Telegram ke w/h attributes
+# par aankh-band bharosa GALAT nikla — uploader ne 1080p file par bhi default
+# 1280×720 likh rakha tha. Isliye ab media_probe.py file ke ACTUAL BYTES
+# (container header) se asli w/h/duration nikalta hai, aur probed values
+# Telegram attributes ko OVERRIDE karti hain (neeche `probed` param). Version
+# bump se purane (v1, possibly-jhoothe) docs migration me dobara uthenge aur
+# probe se sach likha jayega — ye re-run ek baar ka hai, uske baad v2 final.
 # ─────────────────────────────────────────────────────────
-META_SCHEMA_VERSION = 1  # future me meta ka shape badle to version bump ho jayega
+META_SCHEMA_VERSION = 2  # v1 → Telegram attrs copy; v2 → probed real w/h/duration
 
-def build_media_meta(media):
-    """media object se {v, w, h, mime} dict banata hai (pure function — testable)."""
+def build_media_meta(media, probed=None):
+    """media object se {v, w, h, mime} dict banata hai (pure function — testable).
+
+    `probed` = media_probe.probe_telegram_file() ka result ({w, h, duration}).
+    File ke actual bytes se nikle w/h Telegram attributes se ZYADA sachche hain
+    (uploader aksar default 1280×720 likh deta hai), isliye probed dims mile to
+    wahi likhte hain. probed None/partial ho to attributes (purana behaviour).
+    """
+    w = int(getattr(media, "width", 0) or 0)
+    h = int(getattr(media, "height", 0) or 0)
+    if probed:
+        try:
+            pw, ph = int(probed.get("w") or 0), int(probed.get("h") or 0)
+        except (TypeError, ValueError):
+            pw = ph = 0
+        if pw > 0 and ph > 0:
+            w, h = pw, ph
     return {
         "v": META_SCHEMA_VERSION,
-        "w": int(getattr(media, "width", 0) or 0),
-        "h": int(getattr(media, "height", 0) or 0),
+        "w": w,
+        "h": h,
         "mime": str(getattr(media, "mime_type", None) or ""),
     }
 
@@ -246,7 +269,12 @@ def media_true_type(media):
 def build_meta_migration_query():
     """Jin docs me duration ya meta adhoora hai, unka mongo filter.
 
-    - `meta.v` missing/!= current  → meta kabhi likha hi nahi gaya (ya purana schema)
+    - `meta.v` missing/!= current  → meta kabhi likha hi nahi gaya, ya purana
+      schema (v1 docs dobara uthenge — unke w/h Telegram attributes se copy hue
+      the jo jhoothe ho sakte hain; v2 run me probe se asli dims likhenge).
+      ℹ️ v1→v2 re-run ek baar ka hai (audio/PDF docs bhi ek baar chhuenge —
+      unpar probe skip hota hai, sirf v2 finalize hota hai; query simple rakhne
+      ke liye inhe exclude nahi kiya).
     - `file_type` "document" hai par `meta.mime` video/audio ka → asli me video/audio
       file galat tarah se index hui thi (mime_type se pakad kar theek karte hain).
       ℹ️ Ye files Telegram par ASLI VIDEO hain (play bhi hoti hain) — sirf DB
@@ -259,6 +287,7 @@ def build_meta_migration_query():
     `meta.v` already set hai uski duration 0 hi rahegi (Document object par
     duration attribute hota hi nahi), to wo har run me dobara uthati — bina koi
     fayda. Pehli baar process hone ke baad doc query se apne aap nikal jaati hai.
+    (Document-as-video ka duration ab probe se mil jaata hai — attributes se nahi.)
     """
     return {
         "$and": [
@@ -273,7 +302,7 @@ def build_meta_migration_query():
         ],
     }
 
-async def apply_media_meta_update(col, file_id, media, current_type=None):
+async def apply_media_meta_update(col, file_id, media, current_type=None, probed=None):
     """Fetched media object se duration + meta.w/h/mime DB me likh deta hai.
 
     duration sirf tab likhte hain jab media par ho — documents par duration
@@ -284,13 +313,26 @@ async def apply_media_meta_update(col, file_id, media, current_type=None):
     document likha hai par asli me video/audio hai (mime_type se pata chalta
     hai) → "video"/"audio" likh deta hai. Isse wo doc query se nikal jaata hai,
     to ye ek hi baar chalta hai (infinite loop nahi hota).
+
+    🔍 `probed` (media_probe se asli w/h/duration) mile to wahi jeetta hai —
+    Telegram attributes uploader ke likhe hote hain aur jhoothe ho sakte hain
+    (1280×720 default wala bug), jabki probe file ke actual bytes se bolta hai.
     """
-    meta = build_media_meta(media)
+    meta = build_media_meta(media, probed)
     set_payload = {f"meta.{k}": v for k, v in meta.items()}
 
-    duration = getattr(media, "duration", None)
-    if duration:
-        set_payload["duration"] = int(duration)
+    probed_dur = 0
+    if probed:
+        try:
+            probed_dur = int(probed.get("duration") or 0)
+        except (TypeError, ValueError):
+            probed_dur = 0
+    if probed_dur > 0:
+        set_payload["duration"] = probed_dur
+    else:
+        duration = getattr(media, "duration", None)
+        if duration:
+            set_payload["duration"] = int(duration)
 
     if current_type is not None:
         true_type = media_true_type(media)
@@ -313,7 +355,7 @@ async def mark_meta_migration_error(col, file_id):
 # ─────────────────────────────────────────────────────────
 # 💾 SAVE FILE
 # ─────────────────────────────────────────────────────────
-async def save_file(media, collection_type="primary"):
+async def save_file(media, collection_type="primary", probed=None):
     try:
         file_id = unpack_new_file_id(media.file_id)
         if not file_id: return "err"
@@ -324,7 +366,7 @@ async def save_file(media, collection_type="primary"):
         # warna wahi gadbad dobara hoti jo purani files me hui hai
         file_type = media_true_type(media)
         col = COLLECTIONS.get(collection_type, primary)
-        
+
         existing_doc = await col.find_one({"_id": file_id}, {"_id": 1})
         if existing_doc:
             return "dup"
@@ -333,8 +375,16 @@ async def save_file(media, collection_type="primary"):
         # me dikhane ke liye (Telegram bot ke messages me jaan-boojhkar nahi bhejte).
         # hydrogram me Video/Animation/Audio par .duration hota hai, Document par nahi,
         # isliye getattr se safe rakha hai (documents ke liye 0 → UI me chip hide).
-        duration = int(getattr(media, "duration", 0) or 0)
-        meta = build_media_meta(media)
+        # 🔍 probed (actual-bytes) duration mile to wahi — uploader ka attribute
+        # aksar default/guess hota hai (1280×720 wala bug duration par bhi lagu tha).
+        probed_dur = 0
+        if probed:
+            try:
+                probed_dur = int(probed.get("duration") or 0)
+            except (TypeError, ValueError):
+                probed_dur = 0
+        duration = probed_dur if probed_dur > 0 else int(getattr(media, "duration", 0) or 0)
+        meta = build_media_meta(media, probed)
 
         # ✅ meta ko dotted keys ($set: {"meta.w": ...}) se likhna zaroori hai —
         # agar poora "meta" sub-document ek $set me bhejte, to future me kisi
