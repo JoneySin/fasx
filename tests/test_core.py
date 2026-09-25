@@ -1592,6 +1592,96 @@ class TestIndexTimeTypeGuard(unittest.TestCase):
         self.assertNotIn("type(media).__name__.lower()", src)
 
 
+def _fake_media(type_name, **attrs):
+    """Telegram jaisa fake media object — `type(m).__name__` == type_name.
+
+    (class body me `__name__ = ...` kaam nahi karta: `type.__name__` metaclass
+    par data-descriptor hai, isliye class-dict entry ko shadow kar deta hai.)
+    """
+    return type(type_name, (), attrs)()
+
+
+def _video(w=1920, h=1080, dur=7260, mime="video/x-matroska"):
+    """Telegram par ASLI VIDEO — duration/width/height/mime sab hota hai."""
+    return _fake_media("Video", width=w, height=h, duration=dur,
+                       mime_type=mime, file_size=10 ** 8)
+
+
+def _document(mime="application/pdf"):
+    return _fake_media("Document", mime_type=mime, file_size=10 ** 7)
+
+
+def _audio(dur=245, mime="audio/mpeg"):
+    return _fake_media("Audio", duration=dur, mime_type=mime, file_size=10 ** 7)
+
+
+class TestWrongFileTypeRepair(unittest.TestCase):
+    """⭐ ASLI BUG: file Telegram par VIDEO hai (play bhi hoti hai), par purane
+    code ke bug se DB me `file_type: "document"` likh gaya tha. Migration ko
+    type + duration + w + h + mime — sab theek karna chahiye, bina re-index."""
+
+    def _apply(self, doc, media):
+        import asyncio
+        import database.ia_filterdb as fdb
+
+        writes = []
+
+        class FakeCol:
+            async def update_one(self, flt, payload, **k):
+                writes.append((flt, payload))
+
+        asyncio.run(fdb.apply_media_meta_update(
+            FakeCol(), doc["_id"], media, current_type=doc.get("file_type")))
+        return writes[0][1]
+
+    def test_document_labelled_video_gets_full_fix(self):
+        doc = {"_id": "F1", "file_type": "document", "file_ref": "V1"}
+        payload = self._apply(doc, _video())
+
+        self.assertEqual(payload["$set"]["file_type"], "video")
+        self.assertEqual(payload["$set"]["duration"], 7260)
+        self.assertEqual(payload["$set"]["meta.w"], 1920)
+        self.assertEqual(payload["$set"]["meta.h"], 1080)
+        self.assertEqual(payload["$set"]["meta.mime"], "video/x-matroska")
+        self.assertEqual(payload["$unset"], {"meta.err": ""})
+
+    def test_already_migrated_wrong_type_only_type_written(self):
+        """Pehle wale migration run me meta/duration bhul chuke the, sirf type galat."""
+        doc = {"_id": "F2", "file_type": "document", "duration": 7260,
+               "meta": {"v": 1, "w": 1920, "h": 1080, "mime": "video/x-matroska"}}
+        payload = self._apply(doc, _video())
+        self.assertEqual(payload["$set"]["file_type"], "video")
+        # baaki sab wapas wahi value — koi data nahi mitta
+        self.assertEqual(payload["$set"]["meta.w"], 1920)
+        self.assertEqual(payload["$set"]["duration"], 7260)
+
+    def test_mp4_video(self):
+        doc = {"_id": "F3", "file_type": "document"}
+        payload = self._apply(doc, _video(1280, 720, 3600, "video/mp4"))
+        self.assertEqual(payload["$set"]["file_type"], "video")
+        self.assertEqual(payload["$set"]["meta.mime"], "video/mp4")
+        self.assertEqual(payload["$set"]["duration"], 3600)
+
+    def test_wrongly_labelled_audio(self):
+        doc = {"_id": "F4", "file_type": "document"}
+
+        payload = self._apply(doc, _audio())
+        self.assertEqual(payload["$set"]["file_type"], "audio")
+        self.assertEqual(payload["$set"]["duration"], 245)
+
+    def test_real_document_type_untouched(self):
+        doc = {"_id": "F5", "file_type": "document"}
+        payload = self._apply(doc, _document())
+        self.assertNotIn("file_type", payload["$set"])
+        self.assertEqual(payload["$set"]["meta.mime"], "application/pdf")
+
+    def test_correct_video_type_untouched(self):
+        doc = {"_id": "F6", "file_type": "video"}
+        payload = self._apply(doc, _video())
+        self.assertNotIn("file_type", payload["$set"])
+        self.assertEqual(payload["$set"]["duration"], 7260)
+
+
 class TestMigrationThrottle(unittest.TestCase):
     """User ka instruction: per-file gap 1-3s — na flood-wait lage, na spam-report."""
 

@@ -248,7 +248,11 @@ def build_meta_migration_query():
 
     - `meta.v` missing/!= current  → meta kabhi likha hi nahi gaya (ya purana schema)
     - `file_type` "document" hai par `meta.mime` video/audio ka → asli me video/audio
-      file galat tarah se index hui thi (mime_type se pakad kar theek karte hain)
+      file galat tarah se index hui thi (mime_type se pakad kar theek karte hain).
+      ℹ️ Ye files Telegram par ASLI VIDEO hain (play bhi hoti hain) — sirf DB
+      me purane code ke bug se "document" likh gaya tha. Isliye inhe fetch karne
+      par poora Video object milta hai, aur duration + w + h + mime + type sab
+      ek saath theek ho jaata hai.
     - `meta.err` wale (tooti hui file_ref) skip — warna har run me dobara fail honge
 
     ℹ️ "duration adhoora" wala branch jaan-boojhkar NAHI hai: jo doc par
