@@ -10,6 +10,7 @@ Run:  python -m unittest discover -s tests -v
 """
 import os
 import sys
+import inspect
 import unittest
 
 # ── info.py ko import-time validation se bachane ke liye env stubs ──
@@ -1296,6 +1297,11 @@ def _doc_matches(query, doc):
                 elif op == "$ne":
                     if present and actual == val:
                         return False
+                elif op == "$regex":
+                    import re as _re
+                    actual_str = "" if not present else str(actual)
+                    if not _re.search(val, actual_str):
+                        return False
                 elif op == "$in":
                     # missing field = None; `$in: [null]` missing ko bhi match karta hai
                     if (actual if present else None) not in val:
@@ -1326,18 +1332,35 @@ class TestMetaMigrationQuery(unittest.TestCase):
     def test_matches_video_without_meta(self):
         self.assertTrue(_doc_matches(build_q(), {"file_type": "video"}))
 
-    def test_matches_video_with_missing_duration(self):
+    def test_document_with_video_mime_is_matched(self):
+        """Asli video file par 'document' likha hai — mime_type se pakad kar theek karo."""
+        doc = {"file_type": "document", "meta": {"v": 1, "mime": "video/mp4"}}
+        self.assertTrue(_doc_matches(build_q(), doc))
+
+    def test_document_with_matroska_mime_is_matched(self):
+        doc = {"file_type": "document", "meta": {"v": 1, "mime": "video/x-matroska"}}
+        self.assertTrue(_doc_matches(build_q(), doc))
+
+    def test_document_with_audio_mime_is_matched(self):
+        doc = {"file_type": "document", "meta": {"v": 1, "mime": "audio/mpeg"}}
+        self.assertTrue(_doc_matches(build_q(), doc))
+
+    def test_real_document_not_matched(self):
+        """Asli document (pdf/jpg) ko chhedna nahi — wo dobara na ute."""
+        for mime in ("application/pdf", "image/jpeg", "image/gif", ""):
+            doc = {"file_type": "document", "meta": {"v": 1, "mime": mime}}
+            self.assertFalse(_doc_matches(build_q(), doc), mime)
+
+    def test_already_fixed_video_not_matched(self):
+        """Type theek ho chuka (video) aur meta bhi hai — dobara na uthe."""
+        doc = {"file_type": "video", "duration": 0, "meta": {"v": 1, "mime": "video/mp4"}}
+        self.assertFalse(_doc_matches(build_q(), doc))
+
+    def test_video_with_meta_but_zero_duration_not_matched(self):
+        """Document object par duration attribute hi nahi — retry karne se kuch
+        nahi milega, isliye aisa doc dobara nahi uthta (infinite loop se bachne ke liye)."""
         doc = {"file_type": "video", "duration": 0, "meta": {"v": 1, "w": 1920, "h": 1080}}
-        self.assertTrue(_doc_matches(build_q(), doc))
-
-    def test_matches_video_with_no_duration_field(self):
-        """MongoDB me missing duration = null, to wo bhi migrate hona chahiye."""
-        doc = {"file_type": "video", "meta": {"v": 1, "w": 1920, "h": 1080}}
-        self.assertTrue(_doc_matches(build_q(), doc))
-
-    def test_matches_video_with_null_duration(self):
-        doc = {"file_type": "video", "duration": None, "meta": {"v": 1, "w": 1920, "h": 1080}}
-        self.assertTrue(_doc_matches(build_q(), doc))
+        self.assertFalse(_doc_matches(build_q(), doc))
 
     def test_complete_video_not_matched(self):
         doc = {"file_type": "video", "duration": 7260,
@@ -1361,6 +1384,119 @@ class TestMetaMigrationQuery(unittest.TestCase):
 
     def test_query_is_deterministic(self):
         self.assertEqual(build_q(), build_q())
+
+
+class TestMediaTrueType(unittest.TestCase):
+    """Document me chhupi video/audio ka asli type — mime_type se."""
+
+    def setUp(self):
+        from database.ia_filterdb import media_true_type
+        globals()["media_true_type"] = media_true_type
+
+    def test_video_object(self):
+        class V:
+            pass
+        V.__name__ = "Video"
+        self.assertEqual(media_true_type(V()), "video")
+
+    def test_document_with_video_mime(self):
+        class D:
+            mime_type = "video/mp4"
+        D.__name__ = "Document"
+        self.assertEqual(media_true_type(D()), "video")
+
+    def test_document_with_matroska_mime(self):
+        class D:
+            mime_type = "video/x-matroska"
+        D.__name__ = "Document"
+        self.assertEqual(media_true_type(D()), "video")
+
+    def test_document_with_audio_mime(self):
+        class D:
+            mime_type = "audio/mpeg"
+        D.__name__ = "Document"
+        self.assertEqual(media_true_type(D()), "audio")
+
+    def test_real_document_stays_document(self):
+        class D:
+            mime_type = "application/pdf"
+        D.__name__ = "Document"
+        self.assertEqual(media_true_type(D()), "document")
+
+    def test_image_document_stays_document(self):
+        """jpg/gif document ko jaan-boojhkar document hi rehne dete hain."""
+        for mime in ("image/jpeg", "image/png", "image/gif"):
+            class D:
+                mime_type = mime
+            D.__name__ = "Document"
+            self.assertEqual(media_true_type(D()), "document")
+
+    def test_document_without_mime(self):
+        class D:
+            mime_type = None
+        D.__name__ = "Document"
+        self.assertEqual(media_true_type(D()), "document")
+
+    def test_uppercase_mime(self):
+        class D:
+            mime_type = "VIDEO/MP4"
+        D.__name__ = "Document"
+        self.assertEqual(media_true_type(D()), "video")
+
+
+class TestApplyMediaMetaUpdateTypeFix(unittest.TestCase):
+    """Migration ke waqt galat file_type bhi theek hona chahiye."""
+
+    def _run(self, media, current_type):
+        import asyncio
+        import database.ia_filterdb as fdb
+
+        writes = []
+
+        class FakeCol:
+            async def update_one(self, flt, payload, **k):
+                writes.append((flt, payload))
+
+        asyncio.run(fdb.apply_media_meta_update(FakeCol(), "FID", media, current_type))
+        return writes[0][1]
+
+    def test_document_with_video_mime_gets_video_type(self):
+        class D:
+            width = 0
+            height = 0
+            mime_type = "video/mp4"
+        D.__name__ = "Document"
+
+        payload = self._run(D(), "document")
+        self.assertEqual(payload["$set"]["file_type"], "video")
+        self.assertEqual(payload["$set"]["meta.mime"], "video/mp4")
+        # Document par duration/width/height attribute hi nahi — likha hi nahi jaata
+        self.assertNotIn("duration", payload["$set"])
+        self.assertEqual(payload["$set"]["meta.w"], 0)
+        self.assertEqual(payload["$unset"], {"meta.err": ""})
+
+    def test_correct_type_not_rewritten(self):
+        class V:
+            width = 1920
+            height = 1080
+            mime_type = "video/mp4"
+            duration = 120
+        V.__name__ = "Video"
+
+        payload = self._run(V(), "video")
+        self.assertNotIn("file_type", payload["$set"])
+        self.assertEqual(payload["$set"]["duration"], 120)
+
+    def test_animation_not_touched(self):
+        class A:
+            width = 500
+            height = 500
+            mime_type = "video/mp4"
+            duration = 5
+        A.__name__ = "Animation"
+
+        payload = self._run(A(), "animation")
+        self.assertNotIn("file_type", payload["$set"])
 
 
 class TestApplyMediaMetaUpdate(unittest.TestCase):
@@ -1436,9 +1572,36 @@ class TestMigrationPlugin(unittest.TestCase):
 
     def test_ui_has_all_counters(self):
         from plugins.meta_migrate import get_migration_ui
-        ui = get_migration_ui(50, 100, 40, 5, 5, 60, 60, 50)
-        for token in ("40", "50", "100", "Filled", "Skipped", "Failed"):
+        ui = get_migration_ui(50, 100, 40, 5, 5, 60, 60, 50, type_fixed=7)
+        for token in ("40", "50", "100", "Filled", "Skipped", "Failed", "Type Fixed", "7"):
             self.assertIn(token, ui)
+
+
+class TestIndexTimeTypeGuard(unittest.TestCase):
+    """Index-time par wahi gadbad dobara na ho: video/audio file par galti se
+    'document' likh diya jata tha. `save_file` ko media_true_type use karna chahiye."""
+
+    def test_save_file_uses_true_type(self):
+        import database.ia_filterdb as fdb
+        self.assertIn("media_true_type", fdb.save_file.__code__.co_names)
+
+    def test_save_file_does_not_use_raw_class_name(self):
+        """`type(media).__name__.lower()` seedha nahi hona chahiye."""
+        import database.ia_filterdb as fdb
+        src = inspect.getsource(fdb.save_file)
+        self.assertNotIn("type(media).__name__.lower()", src)
+
+
+class TestMigrationThrottle(unittest.TestCase):
+    """User ka instruction: per-file gap 1-3s — na flood-wait lage, na spam-report."""
+
+    def test_gap_is_between_1_and_3_seconds(self):
+        import plugins.meta_migrate as mm
+        consts = mm.start_meta_migration.__code__.co_consts
+        self.assertIn(1.0, consts)
+        self.assertIn(3.0, consts)
+        self.assertNotIn(0.6, consts)
+        self.assertNotIn(1.2, consts)
 
 
 if __name__ == "__main__":

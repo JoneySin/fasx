@@ -195,6 +195,44 @@ def msg_media(msg):
     return getattr(msg, msg.media.value, None) if getattr(msg, "media", None) else None
 
 # ─────────────────────────────────────────────────────────
+# 🎬 ASLI MEDIA TYPE — "document" me chhupi video/audio bhi pakadta hai
+# ⚠️ YE WOH GADBAD HAI JO REPAIR HOGI: kuch asli video files Telegram par
+#    "document" ki tarah store ho gayi thi (client ne unhe file ki tarah bheja,
+#    video ki tarah nahi), to index ke waqt `type(media).__name__` = "document"
+#    likh diya gaya. File khud video hai — uska mime_type `video/mp4` /
+#    `video/x-matroska` hota hai. Isliye document ke liye mime_type dekh kar
+#    asli type nikalte hain, taaki galat type wapas se na bane.
+#
+# ⚠️ LEKIN: Document object par `duration` / `width` / `height`
+#    ATTRIBUTE HI NAHI HOTA (sirf file_id, file_name, mime_type, file_size,
+#    thumbs). To aisi file ka duration/w/h is tarah NAHI mil sakta — uske liye
+#    file download karke probe karna padega (ya dobara index). Sirf TYPE theek
+#    ho jayega, aur ye bhi bina re-index ke.
+#
+# ℹ️ `image/*` (jpg/png/gif document) jaan-boojhkar nahi chhedte — Telegram
+#    khud unhe document hi rakhta hai, aur search UI video/document maangta hai.
+# ─────────────────────────────────────────────────────────
+_DOC_MIME_TYPE_MAP = (
+    ("video/", "video"),
+    ("audio/", "audio"),
+)
+
+def media_true_type(media):
+    """Media ka asli type — Telegram object se, warna mime_type se.
+
+    Document jo asli me video/audio hai use "video"/"audio" deta hai (pure
+    function, isliye seedhe testable).
+    """
+    obj_type = type(media).__name__.lower()
+    if obj_type != "document":
+        return obj_type
+    mime = (getattr(media, "mime_type", None) or "").lower()
+    for prefix, real in _DOC_MIME_TYPE_MAP:
+        if mime.startswith(prefix):
+            return real
+    return obj_type
+
+# ─────────────────────────────────────────────────────────
 # 🔄 OLD-INDEX META MIGRATION (duration + width/height + mime_type)
 # ✅ Purani indexed files me ye fields missing hain (baad me add hue the).
 # Inhe nikaalne ke liye poora channel dobara index karne ki zaroorat NAHI —
@@ -209,10 +247,14 @@ def build_meta_migration_query():
     """Jin docs me duration ya meta adhoora hai, unka mongo filter.
 
     - `meta.v` missing/!= current  → meta kabhi likha hi nahi gaya (ya purana schema)
-    - video/animation/audio jinki `duration` 0/missing hai → duration adhoora
-      (DOCUMENTS ki duration legitimately 0 hoti hai, isliye wo match nahi hoti —
-      warna documents har run me dobara process hote rehte)
+    - `file_type` "document" hai par `meta.mime` video/audio ka → asli me video/audio
+      file galat tarah se index hui thi (mime_type se pakad kar theek karte hain)
     - `meta.err` wale (tooti hui file_ref) skip — warna har run me dobara fail honge
+
+    ℹ️ "duration adhoora" wala branch jaan-boojhkar NAHI hai: jo doc par
+    `meta.v` already set hai uski duration 0 hi rahegi (Document object par
+    duration attribute hota hi nahi), to wo har run me dobara uthati — bina koi
+    fayda. Pehli baar process hone ke baad doc query se apne aap nikal jaati hai.
     """
     return {
         "$and": [
@@ -220,19 +262,24 @@ def build_meta_migration_query():
             {"$or": [
                 {"meta.v": {"$ne": META_SCHEMA_VERSION}},
                 {"$and": [
-                    {"file_type": {"$in": ["video", "animation", "audio"]}},
-                    {"duration": {"$in": [0, None]}},
+                    {"file_type": "document"},
+                    {"meta.mime": {"$regex": r"^(video|audio)/"}},
                 ]},
             ]},
         ],
     }
 
-async def apply_media_meta_update(col, file_id, media):
+async def apply_media_meta_update(col, file_id, media, current_type=None):
     """Fetched media object se duration + meta.w/h/mime DB me likh deta hai.
 
     duration sirf tab likhte hain jab media par ho — documents par duration
     attribute hota hi nahi, aur unki legit 0 duration overwrap nahi karni.
     `meta.err` hata deta hai (agli baar query me dobara na aaye).
+
+    🎬 `current_type` diya ho to galat `file_type` bhi theek karta hai:
+    document likha hai par asli me video/audio hai (mime_type se pata chalta
+    hai) → "video"/"audio" likh deta hai. Isse wo doc query se nikal jaata hai,
+    to ye ek hi baar chalta hai (infinite loop nahi hota).
     """
     meta = build_media_meta(media)
     set_payload = {f"meta.{k}": v for k, v in meta.items()}
@@ -240,6 +287,11 @@ async def apply_media_meta_update(col, file_id, media):
     duration = getattr(media, "duration", None)
     if duration:
         set_payload["duration"] = int(duration)
+
+    if current_type is not None:
+        true_type = media_true_type(media)
+        if true_type != current_type:
+            set_payload["file_type"] = true_type
 
     await col.update_one(
         {"_id": file_id},
@@ -264,7 +316,9 @@ async def save_file(media, collection_type="primary"):
 
         f_name  = re.sub(r"@\w+|(_|\-|\.|\+)", " ", str(media.file_name or "")).strip()
         caption = re.sub(r"@\w+|(_|\-|\.|\+)", " ", str(media.caption  or "")).strip()
-        file_type = type(media).__name__.lower()
+        # ✅ asli type (document me chhupi video/audio bhi "video"/"audio") —
+        # warna wahi gadbad dobara hoti jo purani files me hui hai
+        file_type = media_true_type(media)
         col = COLLECTIONS.get(collection_type, primary)
         
         existing_doc = await col.find_one({"_id": file_id}, {"_id": 1})

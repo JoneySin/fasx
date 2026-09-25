@@ -9,7 +9,8 @@ from hydrogram.errors import FloodWait, MessageNotModified, BadRequest
 from info import ADMINS, BIN_CHANNEL, LOG_CHANNEL
 from utils import temp, get_readable_time
 from database.ia_filterdb import (FILE_COLLECTIONS, build_meta_migration_query,
-                                  apply_media_meta_update, mark_meta_migration_error, msg_media)
+                                  apply_media_meta_update, mark_meta_migration_error,
+                                  msg_media, media_true_type)
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,8 @@ DELETE_BATCH = 100
 # ─────────────────────────────────────────────────────────
 # 🎨 PROGRESS UI
 # ─────────────────────────────────────────────────────────
-def get_migration_ui(processed, total, filled, skipped, failed, elapsed, eta, speed, running=True):
+def get_migration_ui(processed, total, filled, skipped, failed, elapsed, eta, speed,
+                     type_fixed=0, running=True):
     percent = int((processed / max(total, 1)) * 100)
     dot = "🔴" if percent < 30 else ("🟡" if percent < 70 else "🟢")
     status = "▶️ Running" if running else "⏹ Stopped"
@@ -32,6 +34,7 @@ def get_migration_ui(processed, total, filled, skipped, failed, elapsed, eta, sp
         f"✅ <b>Filled (dur/w/h/mime):</b> <code>{filled:,}</code>",
         f"⏭️ <b>Skipped (no media)  :</b> <code>{skipped:,}</code>",
         f"❌ <b>Failed (broken ref) :</b> <code>{failed:,}</code>",
+        f"🎬 <b>Type Fixed (doc→vid/aud):</b> <code>{type_fixed:,}</code>",
         f"⏱️ <b>Time Remaining :</b> <code>{get_readable_time(eta)}</code>",
         f"⚡ <b>Velocity       :</b> <code>{speed:.1f} f/min</code>",
         "──────────────────────────────",
@@ -65,12 +68,12 @@ async def start_meta_migration(client, status_msg, user_id):
     await status_msg.edit(
         f"📊 <b>Missing info detected:</b> <code>{total_to_process:,}</code> files\n"
         f"Initializing single-bot safe stream pipeline...\n\n"
-        f"<i>💡 Beech me bot restart ho jaaye to koi problem nahi — "
+        f"<i>💡 Document likhi hui asli video/audio files ka type bhi theek ho jayega (mime_type se). Beech me bot restart ho jaaye to koi problem nahi — "
         f"jo files bhul chuki hain wo query se automatically hat jaati hain, "
         f"isi liye command dobara chalane se wahi se continue ho jayega.</i>"
     )
 
-    processed = filled = skipped = failed = 0
+    processed = filled = skipped = failed = type_fixed = 0
     start_time = time.time()
     pending_deletes = []   # BIN_CHANNEL ke temp messages (batch delete hote hain)
 
@@ -115,7 +118,8 @@ async def start_meta_migration(client, status_msg, user_id):
                             "🛑 <b>Migration Cancelled!</b>\n\n"
                             + get_migration_ui(processed, total_to_process, filled,
                                                skipped, failed,
-                                               time.time() - start_time, 0, 0, running=False)
+                                               time.time() - start_time, 0, 0,
+                                               type_fixed=type_fixed, running=False)
                             + "\n\n<i>💡 Jitni files bhul chuki hain unme info save ho chuki hai — "
                               "command dobara chalane se baaki se continue hoga.</i>"
                         )
@@ -138,8 +142,17 @@ async def start_meta_migration(client, status_msg, user_id):
                         if not media:
                             skipped += 1
                         else:
-                            await apply_media_meta_update(collection, doc["_id"], media)
+                            # 🎬 document likha hai par asli me video/audio hai
+                            # (mime_type se pata) — wo bhi isi write me theek hota hai
+                            await apply_media_meta_update(
+                                collection, doc["_id"], media,
+                                current_type=doc.get("file_type"))
                             filled += 1
+                            if media_true_type(media) != doc.get("file_type"):
+                                type_fixed += 1
+                                print(f"🎬 [TYPE FIXED] {doc.get('file_type')} → "
+                                      f"{media_true_type(media)} "
+                                      f"({processed}/{total_to_process}) ✅ {file_label}", flush=True)
                             print(f"💾 [FILLED] ({processed}/{total_to_process}) ✅ {file_label}", flush=True)
 
                         if msg:
@@ -147,9 +160,11 @@ async def start_meta_migration(client, status_msg, user_id):
                             if len(pending_deletes) >= DELETE_BATCH:
                                 await _flush_deletes()
 
-                        # anti-flood gap (warmup jitna conservative nahi — yahan
-                        # upload nahi, sirf cached-send + delete hota hai)
-                        await asyncio.sleep(random.uniform(0.6, 1.2))
+                        # anti-flood gap: 1-3s random. Warmup jitna bhaari nahi
+                        # (yahan upload nahi, sirf cached-send + delete hota hai),
+                        # par itna dheema hi theek hai — Telegram spam-report bhi
+                        # nahi karta aur flood-wait bhi nahi lagta.
+                        await asyncio.sleep(random.uniform(1.0, 3.0))
 
                     except FloodWait as e:
                         if msg:
@@ -189,7 +204,8 @@ async def start_meta_migration(client, status_msg, user_id):
                         try:
                             await status_msg.edit(
                                 get_migration_ui(processed, total_to_process, filled,
-                                                 skipped, failed, elapsed, eta, speed)
+                                                 skipped, failed, elapsed, eta, speed,
+                                                 type_fixed=type_fixed)
                             )
                         except MessageNotModified:
                             pass
@@ -213,6 +229,7 @@ async def start_meta_migration(client, status_msg, user_id):
         f"✅ <b>Filled Info        :</b> <code>{filled:,}</code> Files\n"
         f"⏭️ <b>Skipped (no media) :</b> <code>{skipped:,}</code>\n"
         f"❌ <b>Failed (broken ref):</b> <code>{failed:,}</code>\n"
+        f"🎬 <b>Type Fixed (doc→video/audio):</b> <code>{type_fixed:,}</code>\n"
         f"🕐 <b>Total Time         :</b> <code>{get_readable_time(total_elapsed)}</code>\n\n"
         f"⚡ <i>Dashboard, Mini App aur actor profiles par ab asli duration, "
         f"resolution (W×H) aur mime_type dikhega!</i>"
@@ -231,6 +248,7 @@ async def start_meta_migration(client, status_msg, user_id):
                 f"» Filled: <code>{filled:,}</code>\n"
                 f"» Skipped: <code>{skipped:,}</code>\n"
                 f"» Failed: <code>{failed:,}</code>\n"
+                f"» Type Fixed: <code>{type_fixed:,}</code>\n"
                 f"» Time: <code>{get_readable_time(total_elapsed)}</code>"
             )
         except Exception:
