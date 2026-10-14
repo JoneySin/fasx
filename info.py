@@ -131,6 +131,8 @@ IS_PREMIUM = is_enabled("IS_PREMIUM", True)
 #    कभी GitHub/Docker image/log में नहीं। खाली हो तो बाकी bot सामान्य चलता है, /forward बंद रहता है।
 # FORWARD_DELAY_MIN/MAX: हर सफल video copy के बाद random विराम (सीमा 5–20 सेकंड पर clamp होगी)
 # ─────────────────────────────────────────────
+# FORWARD_ENABLED=false → /forward feature पूरी तरह बंद (handlers जवाब नहीं देते, User Client शुरू नहीं होता)
+FORWARD_ENABLED = is_enabled("FORWARD_ENABLED", True)
 USER_SESSION_STRING = environ.get("USER_SESSION_STRING", "").strip()
 FORWARD_DELAY_MIN = int(environ.get("FORWARD_DELAY_MIN", 5))
 FORWARD_DELAY_MAX = int(environ.get("FORWARD_DELAY_MAX", 20))

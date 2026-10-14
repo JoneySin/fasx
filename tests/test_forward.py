@@ -162,9 +162,10 @@ class TestAdminRestriction(unittest.TestCase):
             fake_client = SimpleNamespace(loop=asyncio.get_running_loop(), executor=None)
             return await pf.ADMIN_PM(fake_client, message)
 
-        self.assertTrue(asyncio.run(check(m(111, enums.ChatType.PRIVATE))))
-        self.assertFalse(asyncio.run(check(m(999, enums.ChatType.PRIVATE))))
-        self.assertFalse(asyncio.run(check(m(111, enums.ChatType.GROUP))))
+        with mock.patch.object(pf, "FORWARD_ENABLED", True):
+            self.assertTrue(asyncio.run(check(m(111, enums.ChatType.PRIVATE))))
+            self.assertFalse(asyncio.run(check(m(999, enums.ChatType.PRIVATE))))
+            self.assertFalse(asyncio.run(check(m(111, enums.ChatType.GROUP))))
 
     def test_callback_rejects_non_admin_and_keeps_setup(self):
         import plugins.forward as pf
@@ -572,6 +573,32 @@ class TestCommands(unittest.TestCase):
         with self.assertRaises(fs.ValidationError) as cm:
             asyncio.run(fs.check_destination(Owner(), DST))
         self.assertIn("member", str(cm.exception))
+
+
+# ─────────────────────────────────────────────
+# 8b. FORWARD_ENABLED feature flag
+# ─────────────────────────────────────────────
+class TestFeatureFlag(unittest.TestCase):
+    def _msg(self):
+        from hydrogram.types import Chat, Message, User
+        return Message(id=1, chat=Chat(id=111, type=enums.ChatType.PRIVATE),
+                       from_user=User(id=111, first_name="t"))
+
+    def test_disabled_flag_blocks_all_forward_handlers(self):
+        import plugins.forward as pf
+        fake_client = SimpleNamespace(executor=None)
+
+        async def check(enabled):
+            with mock.patch.object(pf, "FORWARD_ENABLED", enabled):
+                fake_client.loop = asyncio.get_running_loop()
+                return await pf.ADMIN_PM(fake_client, self._msg())
+
+        self.assertTrue(asyncio.run(check(True)))
+        self.assertFalse(asyncio.run(check(False)))
+
+    def test_info_default_is_enabled(self):
+        import info
+        self.assertIsInstance(info.FORWARD_ENABLED, bool)
 
 
 # ─────────────────────────────────────────────

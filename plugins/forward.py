@@ -20,7 +20,7 @@ from hydrogram import Client, StopPropagation, filters
 from hydrogram.errors import FloodWait
 from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from info import ADMINS
+from info import ADMINS, FORWARD_ENABLED
 from forward_service import (
     ForwardError,
     ForwardJob,
@@ -42,7 +42,9 @@ from user_client import UserSessionError, ensure_user_client, get_user_client
 
 logger = logging.getLogger(__name__)
 
-ADMIN_PM = filters.private & filters.user(ADMINS)
+# FORWARD_ENABLED=false होने पर हर forward handler का filter False → कोई जवाब नहीं, कोई काम नहीं
+FEATURE_ON = filters.create(lambda _, __, ___: bool(FORWARD_ENABLED), name="ForwardEnabled")
+ADMIN_PM = FEATURE_ON & filters.private & filters.user(ADMINS)
 
 # admin_id -> setup state (in-memory; restart पर खत्म — resume के लिए ForwardJobs में checkpoint है)
 SETUP = {}
@@ -224,7 +226,7 @@ async def stop_forward_cmd(client, message):
 # ─────────────────────────────────────────────
 # CALLBACKS (सभी admin-only)
 # ─────────────────────────────────────────────
-@Client.on_callback_query(filters.regex(r"^fwd#"))
+@Client.on_callback_query(FEATURE_ON & filters.regex(r"^fwd#"))
 async def forward_callbacks(client, query):
     if query.from_user is None or query.from_user.id not in ADMINS:
         return await query.answer("⛔ यह केवल admin के लिए है।", show_alert=True)

@@ -41,7 +41,7 @@ from hydrogram.handlers import MessageHandler
 from web import web_app
 from info import (
     API_ID, API_HASH, BOT_TOKEN, PORT, ADMINS, 
-    LOG_CHANNEL, TIME_ZONE
+    LOG_CHANNEL, TIME_ZONE, FORWARD_ENABLED
 )
 from utils import temp
 from database.users_chats_db import db
@@ -117,10 +117,11 @@ class Bot(Client):
         logger.info("✅ Database Connections & Indexes Fully Synced")
 
         # 2b. /forward: restart से छूटे 'running' jobs को interrupted चिह्नित करना (fail-soft)
-        try:
-            await recover_interrupted_forward_jobs(self)
-        except Exception as e:
-            logger.error(f"Forward job recovery skipped: {type(e).__name__}")
+        if FORWARD_ENABLED:
+            try:
+                await recover_interrupted_forward_jobs(self)
+            except Exception as e:
+                logger.error(f"Forward job recovery skipped: {type(e).__name__}")
 
         # 3. Load banned users & chats into Runtime Buckets
         try:
@@ -176,10 +177,13 @@ class Bot(Client):
         temp.B_NAME = me.first_name
 
         # 6b. User Account client (optional; USER_SESSION_STRING न हो/invalid हो तो bot फिर भी चलता है)
-        try:
-            await asyncio.wait_for(start_user_client(), timeout=60)
-        except asyncio.TimeoutError:
-            logger.error("User account client startup timed out — /forward will retry on use")
+        if FORWARD_ENABLED:
+            try:
+                await asyncio.wait_for(start_user_client(), timeout=60)
+            except asyncio.TimeoutError:
+                logger.error("User account client startup timed out — /forward will retry on use")
+        else:
+            logger.info("ℹ️ /forward feature disabled (FORWARD_ENABLED=false)")
 
         # 7. Start Web Server with Health Routes (Combined Non-Blocking Engine Loop)
         self._runner = web.AppRunner(web_app, access_log=None)
@@ -236,11 +240,12 @@ class Bot(Client):
             logger.info("✅ Auto-Delete Engine Flushed & Stopped")
 
         # /forward job: सुरक्षित रोकें (checkpoint सेव), फिर User Account client बंद करें
-        try:
-            await shutdown_forward_jobs()
-        except Exception as e:
-            logger.error(f"Forward job shutdown error: {type(e).__name__}")
-        await stop_user_client()
+        if FORWARD_ENABLED:
+            try:
+                await shutdown_forward_jobs()
+            except Exception as e:
+                logger.error(f"Forward job shutdown error: {type(e).__name__}")
+            await stop_user_client()
 
         await super().stop()
         logger.info("System Halted Gracefully. All Memory Freed ✅")
