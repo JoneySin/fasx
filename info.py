@@ -126,6 +126,16 @@ IS_STREAM = is_enabled("IS_STREAM", True)
 IS_PREMIUM = is_enabled("IS_PREMIUM", True)
 
 # ─────────────────────────────────────────────
+# 👤 USER ACCOUNT (/forward video copy feature)
+# ⚠️ USER_SESSION_STRING एक secret है — केवल Koyeb Environment Variable (Secret) में रखें,
+#    कभी GitHub/Docker image/log में नहीं। खाली हो तो बाकी bot सामान्य चलता है, /forward बंद रहता है।
+# FORWARD_DELAY_MIN/MAX: हर सफल video copy के बाद random विराम (सीमा 5–20 सेकंड पर clamp होगी)
+# ─────────────────────────────────────────────
+USER_SESSION_STRING = environ.get("USER_SESSION_STRING", "").strip()
+FORWARD_DELAY_MIN = int(environ.get("FORWARD_DELAY_MIN", 5))
+FORWARD_DELAY_MAX = int(environ.get("FORWARD_DELAY_MAX", 20))
+
+# ─────────────────────────────────────────────
 # 📝 TEXT FILE CAPTION TEMPLATE
 # ─────────────────────────────────────────────
 FILE_CAPTION = environ.get("FILE_CAPTION", script.FILE_CAPTION)

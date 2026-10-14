@@ -102,7 +102,12 @@ Choose a category below. 👇</b>"""
 • /ban_grp | /unban_grp &lt;id&gt; [reason] - Ban / unban a group
 • /ban_user | /unban_user &lt;id&gt; [reason] - Ban / unban a user
 • /check_db - Primary → cloud migration check
-• /cancel - Cancel a running /check_db
+• /cancel - Cancel a running /check_db or /forward setup
+
+<blockquote><b>🎬 <u>User Account Video Copy:</u> 👇</b></blockquote>
+
+• /forward - Copy videos from source to destination (user account)
+• /stopforward - Stop the running forward job safely
 
 <blockquote><b>⚙️ <u>Group Commands:</u> 👇</b></blockquote>
 
