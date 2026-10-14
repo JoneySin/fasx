@@ -104,6 +104,14 @@ Choose a category below. 👇</b>"""
 • /check_db - Primary → cloud migration check
 • /cancel - Cancel a running /check_db
 
+<blockquote><b>📹 <u>Video Forward (No-Tag Copy):</u> 👇</b></blockquote>
+
+• /forward - Copy videos without forward tag (user login: phone → OTP → 2FA)
+• /fwd - Alias of /forward
+• /forward status - Login &amp; job status
+• /forward logout - Remove saved user login
+• /fstop - Stop a running /forward job
+
 <blockquote><b>⚙️ <u>Group Commands:</u> 👇</b></blockquote>
 
 • /search - Auto Filter
