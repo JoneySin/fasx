@@ -12,8 +12,10 @@ Routing notes (Hydrogram 0.2.0 में सभी matching handlers चलत�
 - /cancel group -2 में है पर StopPropagation नहीं करता, ताकि check_db_TEMP का /cancel भी चले।
 """
 
+import asyncio
 import html
 import logging
+import re
 import time
 
 from hydrogram import Client, StopPropagation, filters
@@ -38,7 +40,17 @@ from forward_service import (
     RESUMABLE_STATUSES,
     get_copy_delay_range,
 )
-from user_client import UserSessionError, ensure_user_client, get_user_client
+from user_client import (
+    LOGIN_PHONE_PROMPT,
+    UserSessionError,
+    begin_login,
+    cancel_login,
+    ensure_user_client,
+    get_user_client,
+    is_login_active,
+    submit_login_code,
+    submit_login_password,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +70,23 @@ def _set_setup(uid, step):
     return st
 
 
+LOGIN_STEPS = ("login_phone", "login_otp", "login_pwd")
+
+
+def _drop_setup(uid):
+    """Setup हटाता है; login चल रहा हो तो उसका temporary client भी बंद करता है।"""
+    st = SETUP.pop(uid, None)
+    if st and st.get("step") in LOGIN_STEPS:
+        asyncio.create_task(cancel_login())
+    return st
+
+
 def _get_setup(uid):
     st = SETUP.get(uid)
     if not st:
         return None
     if time.time() - st["ts"] > SETUP_TTL:
-        SETUP.pop(uid, None)
+        _drop_setup(uid)
         return None
     st["ts"] = time.time()
     return st
@@ -106,6 +129,9 @@ async def forward_cmd(client, message):
     try:
         await ensure_user_client()
     except UserSessionError as e:
+        if e.needs_login:
+            _set_setup(message.from_user.id, "login_phone")
+            return await message.reply(LOGIN_PHONE_PROMPT)
         return await message.reply(str(e))
 
     resume_buttons = []
@@ -136,6 +162,67 @@ async def forward_cmd(client, message):
 # ─────────────────────────────────────────────
 # SETUP INPUT (group -2, admin-only, setup active होने पर ही)
 # ─────────────────────────────────────────────
+async def _handle_login_input(message, state):
+    """Login के तीन steps: phone → OTP → (2FA password). OTP/password सेव नहीं होते।"""
+    uid = message.from_user.id
+    step = state["step"]
+    text = (message.text or "").strip()
+
+    if step in ("login_otp", "login_pwd"):
+        # संवेदनशील संदेश हटाने की कोशिश (bot सकारात्मक न हो तो चुपचाप आगे बढ़ें)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    try:
+        if step == "login_phone":
+            await begin_login(text)
+            _set_setup(uid, "login_otp")
+            reply = (
+                "📨 Telegram ने OTP भेज दिया है (उसी account के app/SMS में देखें)।\n\n"
+                "<b>Step 2/2:</b> OTP यहाँ भेजें (जैसे <code>12345</code>)।\n"
+                "⚠️ OTP इसी chat में दिखेगा — login के बाद उस message को delete कर दें।\n"
+                "रद्द करने के लिए /cancel"
+            )
+        elif step == "login_otp":
+            code = re.sub(r"[\s\-]", "", text)
+            if not code.isdigit():
+                await message.reply("❌ OTP केवल अंकों में भेजें (जैसे 12345)। या /cancel।")
+                return
+            if await submit_login_code(code):
+                _set_setup(uid, "dest")
+                reply = LOGIN_DONE_TEXT
+            else:
+                _set_setup(uid, "login_pwd")
+                reply = (
+                    "🔑 इस account पर 2FA password सेट है।\n"
+                    "2FA password भेजें (संदेश तुरंत delete करने की कोशिश होगी)।\n"
+                    "रद्द करने के लिए /cancel"
+                )
+        else:  # login_pwd
+            await submit_login_password(text)
+            _set_setup(uid, "dest")
+            reply = LOGIN_DONE_TEXT
+    except UserSessionError as e:
+        if not is_login_active():
+            SETUP.pop(uid, None)
+        reply = f"{e}\n\n" + ("" if not is_login_active() else "दोबारा भेजें, या /cancel")
+    except Exception as e:
+        logger.error(f"login step failed: {type(e).__name__}")
+        await cancel_login()
+        SETUP.pop(uid, None)
+        reply = "❌ Login में अनपेक्षित त्रुटि हुई। /forward से फिर शुरू करें।"
+
+    await message.reply(reply)
+
+
+LOGIN_DONE_TEXT = (
+    "✅ <b>User account login सफल!</b> Session सेव हो गया है — अगली बार OTP नहीं माँगा जाएगा।\n\n"
+    "🎬 <b>Step 1/2</b> — Destination group/channel भेजें (ID, @username, t.me link, या message forward)।"
+)
+
+
 def _ref_from_message(message):
     fwd_chat = getattr(message, "forward_from_chat", None)
     if fwd_chat is not None:
@@ -158,12 +245,20 @@ async def forward_setup_input(client, message):
         await message.reply("⬆️ Summary के नीचे ✅ Start या ❌ Cancel दबाएँ, या /cancel भेजें।")
         raise StopPropagation
 
+    if state["step"] in LOGIN_STEPS:
+        await _handle_login_input(message, state)
+        raise StopPropagation
+
     user = get_user_client()
     if user is None:
         try:
             user = await ensure_user_client()
         except UserSessionError as e:
-            await message.reply(str(e))
+            if e.needs_login:
+                _set_setup(message.from_user.id, "login_phone")
+                await message.reply(LOGIN_PHONE_PROMPT)
+            else:
+                await message.reply(str(e))
             raise StopPropagation
 
     status_msg = await message.reply("⏳ User account से जाँच हो रही है…")
@@ -205,8 +300,8 @@ async def forward_setup_input(client, message):
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command("cancel") & ADMIN_PM, group=-2)
 async def forward_cancel_cmd(client, message):
-    if SETUP.pop(message.from_user.id, None) is not None:
-        await message.reply("❌ Forward setup रद्द कर दिया गया। (चल रहा job, यदि कोई है, तो /stopforward से रुकेगा)")
+    if _drop_setup(message.from_user.id) is not None:
+        await message.reply("❌ Setup/login रद्द कर दिया गया। (चल रहा job, यदि कोई है, तो /stopforward से रुकेगा)")
 
 
 # ─────────────────────────────────────────────
@@ -242,7 +337,7 @@ async def forward_callbacks(client, query):
         return await query.answer("⏹ Stop अनुरोध भेजा गया।")
 
     if action == "cancel":
-        SETUP.pop(uid, None)
+        _drop_setup(uid)
         await query.answer("रद्द किया गया।")
         try:
             await query.message.edit("❌ Forward setup रद्द कर दिया गया।")

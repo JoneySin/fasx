@@ -30,6 +30,10 @@ from hydrogram.errors import (  # noqa: E402
     ChatForwardsRestricted,
     ChatWriteForbidden,
     FloodWait,
+    PhoneCodeExpired,
+    PhoneCodeInvalid,
+    SessionPasswordNeeded,
+    SessionRevoked,
     UserNotParticipant,
 )
 
@@ -186,16 +190,31 @@ class TestAdminRestriction(unittest.TestCase):
 # 2. AUTHENTICATION / USER SESSION
 # ─────────────────────────────────────────────
 class TestUserSession(unittest.TestCase):
-    def test_missing_session_gives_recovery_without_secret(self):
-        with mock.patch.object(uc, "USER_SESSION_STRING", ""):
+    def _no_db(self):
+        # DB कभी छुआ न जाए
+        return mock.patch.object(uc, "load_saved_session", mock.AsyncMock(return_value=None))
+
+    def test_missing_session_asks_for_login_without_secret(self):
+        with mock.patch.object(uc, "USER_SESSION_STRING", ""), \
+                mock.patch.object(uc, "_runtime_session", None), self._no_db():
             self.assertFalse(uc.is_session_configured())
             with self.assertRaises(uc.UserSessionError) as cm:
                 asyncio.run(uc.ensure_user_client())
-            self.assertIn("generate_session.py", str(cm.exception))
-            self.assertIn("USER_SESSION_STRING", str(cm.exception))
+            self.assertTrue(cm.exception.needs_login)
+            self.assertIn("/forward", str(cm.exception))
             self.assertFalse(asyncio.run(uc.start_user_client()))
 
-    def test_invalid_session_message_has_no_secret_and_client_not_kept(self):
+    def test_env_session_takes_precedence_over_saved(self):
+        with mock.patch.object(uc, "USER_SESSION_STRING", "ENV"), \
+                mock.patch.object(uc, "_runtime_session", "SAVED"):
+            self.assertEqual(uc.get_session_string(), "ENV")
+            self.assertEqual(uc.session_source(), "env")
+        with mock.patch.object(uc, "USER_SESSION_STRING", ""), \
+                mock.patch.object(uc, "_runtime_session", "SAVED"):
+            self.assertEqual(uc.get_session_string(), "SAVED")
+            self.assertEqual(uc.session_source(), "saved")
+
+    def test_invalid_env_session_no_secret_and_no_auto_login(self):
         secret = "1AQAOMnotARealSessionStringXYZ=="
         fake_client = mock.AsyncMock()
         fake_client.is_connected = False
@@ -205,8 +224,23 @@ class TestUserSession(unittest.TestCase):
             with self.assertRaises(uc.UserSessionError) as cm:
                 asyncio.run(uc.ensure_user_client())
         self.assertNotIn(secret, str(cm.exception))
-        self.assertIn("generate_session.py", str(cm.exception))
+        self.assertFalse(cm.exception.needs_login)
         self.assertIsNone(uc.get_user_client())
+
+    def test_invalid_saved_session_is_cleared_and_login_requested(self):
+        fake_client = mock.AsyncMock()
+        fake_client.is_connected = False
+        fake_client.start.side_effect = SessionRevoked()
+        clear = mock.AsyncMock()
+        with mock.patch.object(uc, "USER_SESSION_STRING", ""), \
+                mock.patch.object(uc, "_runtime_session", "OLDSESSION"), \
+                mock.patch.object(uc, "_build_client", return_value=fake_client), \
+                mock.patch.object(uc, "_clear_saved_session", clear):
+            with self.assertRaises(uc.UserSessionError) as cm:
+                asyncio.run(uc.ensure_user_client())
+        clear.assert_awaited_once()
+        self.assertTrue(cm.exception.needs_login)
+        self.assertNotIn("OLDSESSION", str(cm.exception))
 
     def test_start_user_client_is_non_fatal(self):
         fake_client = mock.AsyncMock()
@@ -224,6 +258,94 @@ class TestUserSession(unittest.TestCase):
         self.assertTrue(kwargs["in_memory"])
         self.assertTrue(kwargs["no_updates"])
         self.assertEqual(kwargs["session_string"], "fakesession")
+
+    def test_phone_normalization(self):
+        self.assertEqual(uc.normalize_phone(" +91 98765-43210 "), "+919876543210")
+        for bad in ("9876543210", "+12", "abc", ""):
+            with self.subTest(bad=bad):
+                with self.assertRaises(uc.UserSessionError):
+                    uc.normalize_phone(bad)
+
+
+class TestInBotLogin(unittest.TestCase):
+    def setUp(self):
+        uc._login.update(client=None, phone=None, hash=None)
+
+    def tearDown(self):
+        uc._login.update(client=None, phone=None, hash=None)
+
+    def _login_client(self, sign_in=None, check_password=None, export="SESS-XYZ"):
+        c = mock.AsyncMock()
+        c.is_connected = True
+        c.send_code.return_value = SimpleNamespace(phone_code_hash="HASH1")
+        c.sign_in.side_effect = sign_in
+        c.check_password.side_effect = check_password
+        c.export_session_string.return_value = export
+        return c
+
+    def test_full_login_with_otp_only(self):
+        client = self._login_client()
+        save = mock.AsyncMock()
+        with mock.patch.object(uc, "Client", return_value=client), \
+                mock.patch.object(uc, "save_session", save), \
+                mock.patch.object(uc, "stop_user_client", mock.AsyncMock()), \
+                mock.patch.object(uc, "ensure_user_client", mock.AsyncMock()):
+            asyncio.run(uc.begin_login("+919876543210"))
+            self.assertTrue(uc.is_login_active())
+            done = asyncio.run(uc.submit_login_code("12345"))
+        self.assertTrue(done)
+        client.sign_in.assert_awaited_once_with("+919876543210", "HASH1", "12345")
+        save.assert_awaited_once_with("SESS-XYZ")
+        self.assertFalse(uc.is_login_active())  # login client साफ़
+
+    def test_full_login_with_2fa(self):
+        client = self._login_client(sign_in=SessionPasswordNeeded(), check_password=None)
+        save = mock.AsyncMock()
+        with mock.patch.object(uc, "Client", return_value=client), \
+                mock.patch.object(uc, "save_session", save), \
+                mock.patch.object(uc, "stop_user_client", mock.AsyncMock()), \
+                mock.patch.object(uc, "ensure_user_client", mock.AsyncMock()):
+            asyncio.run(uc.begin_login("+919876543210"))
+            self.assertFalse(asyncio.run(uc.submit_login_code("55555")))
+            asyncio.run(uc.submit_login_password("my-2fa"))
+        client.check_password.assert_awaited_once_with("my-2fa")
+        save.assert_awaited_once_with("SESS-XYZ")
+
+    def test_wrong_otp_keeps_login_active(self):
+        client = self._login_client(sign_in=PhoneCodeInvalid())
+        with mock.patch.object(uc, "Client", return_value=client):
+            asyncio.run(uc.begin_login("+919876543210"))
+            with self.assertRaises(uc.UserSessionError):
+                asyncio.run(uc.submit_login_code("00000"))
+        self.assertTrue(uc.is_login_active())
+
+    def test_expired_otp_cancels_login(self):
+        client = self._login_client(sign_in=PhoneCodeExpired())
+        with mock.patch.object(uc, "Client", return_value=client):
+            asyncio.run(uc.begin_login("+919876543210"))
+            with self.assertRaises(uc.UserSessionError):
+                asyncio.run(uc.submit_login_code("11111"))
+        self.assertFalse(uc.is_login_active())
+
+    def test_no_secret_in_error_messages(self):
+        client = self._login_client(sign_in=PhoneCodeInvalid())
+        with mock.patch.object(uc, "Client", return_value=client):
+            asyncio.run(uc.begin_login("+919876543210"))
+            with self.assertRaises(uc.UserSessionError) as cm:
+                asyncio.run(uc.submit_login_code("99999"))
+        self.assertNotIn("99999", str(cm.exception))
+
+    def test_cancel_login_disconnects(self):
+        client = self._login_client()
+        with mock.patch.object(uc, "Client", return_value=client):
+            asyncio.run(uc.begin_login("+919876543210"))
+            asyncio.run(uc.cancel_login())
+        self.assertFalse(uc.is_login_active())
+        client.disconnect.assert_awaited()
+
+    def test_submit_without_login_session(self):
+        with self.assertRaises(uc.UserSessionError):
+            asyncio.run(uc.submit_login_code("12345"))
 
 
 # ─────────────────────────────────────────────
@@ -599,6 +721,59 @@ class TestFeatureFlag(unittest.TestCase):
     def test_info_default_is_enabled(self):
         import info
         self.assertIsInstance(info.FORWARD_ENABLED, bool)
+
+
+class TestLoginSteps(unittest.TestCase):
+    def setUp(self):
+        import plugins.forward as pf
+        pf.SETUP.clear()
+        self.pf = pf
+
+    def tearDown(self):
+        self.pf.SETUP.clear()
+
+    def _msg(self, text):
+        return SimpleNamespace(from_user=SimpleNamespace(id=111), text=text,
+                               reply=mock.AsyncMock(), delete=mock.AsyncMock())
+
+    def test_phone_then_otp_then_2fa_steps(self):
+        pf = self.pf
+        pf._set_setup(111, "login_phone")
+        with mock.patch.object(pf, "begin_login", mock.AsyncMock()) as begin:
+            m = self._msg("+919876543210")
+            asyncio.run(pf._handle_login_input(m, pf.SETUP[111]))
+            begin.assert_awaited_once_with("+919876543210")
+        self.assertEqual(pf.SETUP[111]["step"], "login_otp")
+
+        with mock.patch.object(pf, "submit_login_code", mock.AsyncMock(return_value=False)):
+            m = self._msg("1 2 3 4 5")
+            asyncio.run(pf._handle_login_input(m, pf.SETUP[111]))
+        self.assertEqual(pf.SETUP[111]["step"], "login_pwd")
+        m.delete.assert_awaited()  # OTP वाला message delete करने की कोशिश
+
+    def test_otp_letters_rejected_without_submitting(self):
+        pf = self.pf
+        pf._set_setup(111, "login_otp")
+        with mock.patch.object(pf, "submit_login_code", mock.AsyncMock()) as sub:
+            asyncio.run(pf._handle_login_input(self._msg("abcd"), pf.SETUP[111]))
+            sub.assert_not_awaited()
+        self.assertEqual(pf.SETUP[111]["step"], "login_otp")
+
+    def test_success_moves_to_destination_step(self):
+        pf = self.pf
+        pf._set_setup(111, "login_pwd")
+        with mock.patch.object(pf, "submit_login_password", mock.AsyncMock()):
+            asyncio.run(pf._handle_login_input(self._msg("my-2fa"), pf.SETUP[111]))
+        self.assertEqual(pf.SETUP[111]["step"], "dest")
+
+    def test_forward_without_session_starts_login(self):
+        pf = self.pf
+        from user_client import UserSessionError
+        msg_ = SimpleNamespace(from_user=SimpleNamespace(id=111), reply=mock.AsyncMock())
+        with mock.patch.object(pf, "ensure_user_client",
+                               mock.AsyncMock(side_effect=UserSessionError("x", needs_login=True))):
+            asyncio.run(pf.forward_cmd(None, msg_))
+        self.assertEqual(pf.SETUP[111]["step"], "login_phone")
 
 
 # ─────────────────────────────────────────────

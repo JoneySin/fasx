@@ -20,12 +20,15 @@ logger = logging.getLogger(__name__)
 
 JOBS_COLLECTION = "ForwardJobs"
 COPIED_COLLECTION = "ForwardCopied"
+ACCOUNT_COLLECTION = "ForwardAccount"
+SESSION_DOC_ID = "user_session"
 
 
 class ForwardStore:
     def __init__(self, database):
         self.jobs = database[JOBS_COLLECTION]
         self.copied = database[COPIED_COLLECTION]
+        self.account = database[ACCOUNT_COLLECTION]
 
     async def ensure_indexes(self):
         await self.copied.create_index(
@@ -34,6 +37,22 @@ class ForwardStore:
             name="uniq_forward_copy",
         )
         await self.jobs.create_index([("status", 1), ("admin_id", 1)], name="forward_job_status_idx")
+
+    # ───────── USER SESSION (in-bot login) ─────────
+    # ⚠️ केवल session string सेव होता है। OTP / 2FA password कभी नहीं।
+    async def save_session(self, session_string: str):
+        await self.account.update_one(
+            {"_id": SESSION_DOC_ID},
+            {"$set": {"session_string": session_string, "saved_at": get_local_now()}},
+            upsert=True,
+        )
+
+    async def load_session(self):
+        doc = await self.account.find_one({"_id": SESSION_DOC_ID}, {"session_string": 1})
+        return doc.get("session_string") if doc else None
+
+    async def clear_session(self):
+        await self.account.delete_one({"_id": SESSION_DOC_ID})
 
     # ───────── JOBS ─────────
     async def create_job(self, fields: dict) -> str:
