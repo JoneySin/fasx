@@ -326,6 +326,45 @@ class Database:
             logger.error(f"Error counting premium users: {e}")
             return 0
 
+    # ───────────────── /forward USER-ACCOUNT (USERBOT) SESSION ─────────────────
+    # ⚠️ सुरक्षा: यहाँ StringSession सेव होती है ताकि /forward का यूज़र-अकाउंट
+    # लॉगिन एक बार हो और रीस्टार्ट (Koyeb redeploy) के बाद दोबारा OTP न माँगे।
+    # कोई भी सेंसिटिव डेटा (OTP/पासवर्ड) यहाँ कभी सेव नहीं होता — सिर्फ session.
+    async def get_forward_session(self):
+        """सेव किया हुआ userbot session लौटाता है (न हो तो None)"""
+        try:
+            return await self.db["forward_session"].find_one({"_id": "userbot"})
+        except Exception as e:
+            logger.error(f"Error loading forward session: {e}")
+            return None
+
+    async def save_forward_session(self, session_string, phone, user_id):
+        """नया userbot session सेव/अपडेट करता है"""
+        try:
+            await self.db["forward_session"].update_one(
+                {"_id": "userbot"},
+                {"$set": {
+                    "session": session_string,
+                    "phone": phone,
+                    "user_id": int(user_id),
+                    "logged_at": get_local_now(),
+                }},
+                upsert=True,
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error saving forward session: {e}")
+            return False
+
+    async def clear_forward_session(self):
+        """userbot session डिलीट करता है (/forward logout)"""
+        try:
+            await self.db["forward_session"].delete_one({"_id": "userbot"})
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing forward session: {e}")
+            return False
+
 # =========================================
 # 🚀 INITIALIZE DATABASES
 # =========================================
