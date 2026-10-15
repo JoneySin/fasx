@@ -156,6 +156,23 @@ async def save_group_settings(group_id, key, value):
 # ─────────────────────────────────────────────
 # 📦 FORMATTING & RAIN TIME UTILS
 # ─────────────────────────────────────────────
+def build_mini_app_url(base_url: str) -> str:
+    """Mini-App ka HTTPS URL banata hai (auto http→https + trailing slash fix).
+
+    ✅ DRY: pehle ye helper sirf plugins/commands.py me tha — ab multi-bot ke
+    dono menus (filter + group-manager) ek hi jagah se URL lete hain, taaki
+    dono panels ka link hamesha same bane.
+    """
+    url = (base_url or "").strip()
+    if not url:
+        return ""
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    if not url.startswith("https://"):
+        url = f"https://{url}"
+    return f"{url.rstrip('/')}/miniapp"
+
+
 def get_size(size):
     units = ["Bytes", "KB", "MB", "GB", "TB"]
     size, i = float(size), 0

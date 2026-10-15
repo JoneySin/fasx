@@ -1068,16 +1068,28 @@ def _walk_command_filters(f, depth=0, seen=None):
 
 
 def _live_bot_commands():
-    """Har plugin import karke actually-registered commands ka set."""
+    """Har plugin import karke actually-registered commands ka set.
+
+    🧠 MULTI-BOT: bot.py ab do plugin-roots load karta hai — standard
+    ``plugins`` (auto filter) aur ``groupmgmt`` (group manager). Test bhi
+    dono roots scan karta hai, warna group-manager commands "undocumented"
+    ya "dead" jhoot mojood lagte.
+    """
     import importlib
     import pkgutil
+    from bot import EXTRA_PLUGIN_ROOTS
+
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    roots = ["plugins", *EXTRA_PLUGIN_ROOTS]
+
     live = set()
-    for mod in sorted(pkgutil.iter_modules([os.path.join(root, "plugins")])):
-        m = importlib.import_module("plugins." + mod.name)
-        for _name, obj in vars(m).items():
-            for handler, _grp in (getattr(obj, "handlers", None) or []):
-                live.update(_walk_command_filters(handler.filters))
+    for plugin_root in roots:
+        base = os.path.join(root, plugin_root.replace(".", "/"))
+        for mod in sorted(pkgutil.iter_modules([base])):
+            m = importlib.import_module(f"{plugin_root}." + mod.name)
+            for _name, obj in vars(m).items():
+                for handler, _grp in (getattr(obj, "handlers", None) or []):
+                    live.update(_walk_command_filters(handler.filters))
     return live
 
 
@@ -1087,7 +1099,11 @@ def _listed_commands():
     import Script
 
     listed = set()
-    for block in ("USER_COMMAND_TXT", "ADMIN_COMMAND_TXT"):
+    # 🧠 MULTI-BOT: group-manager ke panels bhi scan hote hain (GM_HELP_TXT
+    # users ko PM me dikhta hai, GM_ADMIN_COMMAND_TXT help menu ke "GM
+    # Commands" button me).
+    for block in ("USER_COMMAND_TXT", "ADMIN_COMMAND_TXT", "GM_HELP_TXT",
+                  "GM_ADMIN_COMMAND_TXT"):
         txt = getattr(Script.script, block, "")
         txt = re.sub(r"</?[a-z]+>", "", txt)   # HTML tags command nahi hain
         listed.update(re.findall(r"/([a-z_]+)", txt))
@@ -1120,11 +1136,21 @@ class TestCommandListMatchesHandlers(unittest.TestCase):
         self.assertGreaterEqual(len(_live_bot_commands()), 25)
 
     def test_removed_dead_commands_stay_removed(self):
+        """Auto-filter bot ke wo commands jo kabhi delete ho gaye.
+
+        ⚠️ NOTE (multi-bot): /mute, /unmute, /ban, /warn, /resetwarn ab
+        JAAN-BOOJHkar wapas aaye hain — par auto-filter bot ke taur par nahi,
+        balki **Group Manager bot** (groupmgmt/) ke moderation toolkit ke
+        taur par. Isliye wo is list se hata diye gaye hain; baaki filter-side
+        kachra commands aaj bhi listed nahi hone chahiye.
+        """
         listed = _listed_commands()
-        for gone in ("fileid", "ask", "ai", "mute", "unmute", "ban", "warn",
-                     "resetwarn", "addblacklist", "removeblacklist",
+        for gone in ("fileid", "ask", "ai", "addblacklist", "removeblacklist",
                      "blacklist", "dlink", "removedlink", "dlinklist"):
             self.assertNotIn(gone, listed, f"/{gone} wapas list me aa gaya")
+        # moderation commands group-manager panel me honi hi chahiye
+        for gm_cmd in ("ban", "warn", "resetwarn", "mute", "unmute", "purge"):
+            self.assertIn(gm_cmd, listed, f"/{gm_cmd} group-manager panel me nahi mila")
 
 
 class TestResolutionChip(unittest.TestCase):

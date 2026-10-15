@@ -114,6 +114,8 @@ class Database:
         self.users, self.groups, self.premium = self.db.Users, self.db.Groups, self.db.Premiums
         self.settings, self.warns = self.db.Settings, self.db.Warns
         self.delete_queue = self.db.AutoDeleteQueue 
+        # 🧠 MULTI-BOT: per-user mode (filter | management) collection
+        self.usermodes = self.db.UserModes
 
     async def _ensure_indexes(self):
         # बोट कलेक्शंस के लिए इंडेक्स सिंक
@@ -145,8 +147,39 @@ class Database:
             await self.delete_queue.create_index([("delete_at", 1)])
         except: pass
 
+        # 🧠 MULTI-BOT: user-mode collection ka unique index (id se lookup fast)
+        try:
+            await self.usermodes.create_index("id", unique=True)
+        except Exception as e:
+            logger.warning(f"UserModes index warn: {e}")
+
     # ⚙️ Default Global Settings Config
-    df_set = {"file_secure": PROTECT_CONTENT, "spell_check": SPELL_CHECK, "auto_delete": AUTO_DELETE, "caption": FILE_CAPTION, "search_enabled": True, "blacklist": [], "dlink": {}, "notes": {}}
+    # ✅ DRY NOTE: "blacklist" (word-block list) pehle se yahan tha — ab wo
+    # GROUP-MANAGEMENT (multi-bot) ka official word-blacklist hai aur iske saath
+    # baki block-list keys (links / media / language) bhi add ho gaye hain.
+    # Naye keys purane groups me bhi default value ke saath aa jaate hain
+    # (get_settings() df_set ke saath merge karta hai).
+    df_set = {
+        "file_secure": PROTECT_CONTENT,
+        "spell_check": SPELL_CHECK,
+        "auto_delete": AUTO_DELETE,
+        "caption": FILE_CAPTION,
+        "search_enabled": True,
+        "blacklist": [],          # 🚫 block-list: words
+        "dlink": {},
+        "notes": {},
+        # ── 🛡️ GROUP MANAGEMENT (multi-bot) ──
+        "mgmt_enabled": True,     # group me manager features on/off
+        "block_links": [],        # 🚫 blocked domains / links
+        "allow_links": [],        # ✅ allowed (whitelist) domains
+        "block_media": [],        # 🚫 blocked media types (photo, video, ...)
+        "allowed_langs": [],      # 🌍 allowed languages ([] = off)
+        "warn_limit": 3,          # ⚠️ warnings ke baad auto-ban
+        "delete_on_violation": True,  # 🗑 violating message delete?
+        "banned_users": {},       # 🚫 per-group banned users {uid: reason}
+        "muted_users": {},        # 🔇 per-group muted users {uid: reason}
+        "antiflood": {"limit": 0, "window": 10},  # 🌊 0 = antiflood OFF
+    }
 
     # ✅ DRY: ऊपर वाले DEFAULT_PLAN_STATUS को ही base माना गया है (कॉपी नहीं, वही object)
     df_prm = DEFAULT_PLAN_STATUS
@@ -180,7 +213,22 @@ class Database:
 
     # ───────────────── GROUPS ─────────────────
     async def add_chat(self, gid, title): 
-        await self.groups.update_one({"id": int(gid)}, {"$set": {"title": title}, "$setOnInsert": {"settings": self.df_set, "chat_status": self.df_chat}}, upsert=True)
+        # 🧠 MULTI-BOT: naya group insert hote waqt mode = MANAGEMENT rakha jata
+        # hai (kyunki group me bot ADD hone par group-manager banta hai). Admin
+        # jab PM se /add_group <id> karta hai to uske turant baad set_group_mode()
+        # se ye mode FILTER me badal jata hai.
+        await self.groups.update_one(
+            {"id": int(gid)},
+            {
+                "$set": {"title": title},
+                "$setOnInsert": {
+                    "settings": self.df_set,
+                    "chat_status": self.df_chat,
+                    "mode": "management",
+                },
+            },
+            upsert=True,
+        )
         
     async def get_chat(self, gid): 
         return (await self.groups.find_one({"id": int(gid)}, {"chat_status": 1}) or {}).get("chat_status", None)
@@ -190,6 +238,50 @@ class Database:
     
     async def get_all_chats(self): 
         return self.groups.find({}, {"id": 1})
+    
+    # ───────────────── 🧠 MULTI-BOT MODES ─────────────────
+    async def get_group_mode_info(self, gid):
+        """(registered, mode) — ek hi DB hit me.
+
+        ``registered=False`` matlab ye group DB me pehle se hi nahi hai
+        (bot abhi add hua hai ya DB fresh hai) → modes.py ise MANAGEMENT
+        maanta hai. ``registered=True, mode=None`` matlab purana (legacy)
+        auto-filter group hai jisme naya mode field nahi hai → backward
+        compatibility ke liye FILTER maana jata hai.
+        """
+        doc = await self.groups.find_one({"id": int(gid)}, {"mode": 1})
+        if not doc:
+            return False, None
+        return True, doc.get("mode")
+
+    async def set_group_mode(self, gid, mode):
+        """Group ka mode set karta hai (bot-admin PM registration / switch)."""
+        await self.groups.update_one(
+            {"id": int(gid)},
+            {"$set": {"mode": mode}},
+            upsert=True
+        )
+
+    async def get_user_mode(self, uid):
+        """User ka saved mode (filter | management). Abhi choose nahi kiya to None."""
+        doc = await self.usermodes.find_one({"id": int(uid)}, {"mode": 1})
+        return (doc or {}).get("mode")
+
+    async def set_user_mode(self, uid, mode):
+        """User ka mode permanently save karta hai."""
+        await self.usermodes.update_one(
+            {"id": int(uid)},
+            {"$set": {"mode": mode}},
+            upsert=True
+        )
+
+    async def total_mode_users_count(self, mode):
+        """Kitne users ne ek particular mode choose kiya (stats ke liye)."""
+        try:
+            return await self.usermodes.count_documents({"mode": mode})
+        except Exception as e:
+            logger.error(f"Error counting mode users: {e}")
+            return 0
     
     async def disable_chat(self, gid, rsn="No Reason"): 
         await self.groups.update_one({"id": int(gid)}, {"$set": {"chat_status": {"is_disabled": True, "reason": rsn}}})

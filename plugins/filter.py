@@ -14,6 +14,9 @@ from utils import is_premium, get_size, is_check_admin, temp, get_settings, save
 from database.ia_filterdb import get_search_results, get_db_spell_suggestions
 from database.users_chats_db import db
 from Script import script  
+# 🧠 MULTI-BOT: mode engine (group mode + user mode)
+from modes import MODE_MGMT, get_user_mode
+from groupmgmt.core import is_mgmt_chat
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +210,16 @@ def get_settings_markup(settings):
 @Client.on_message(filters.command("settings") & filters.group)
 async def group_settings_panel(client, message):
     if not await is_check_admin(client, message.chat.id, message.from_user.id): return
+    # 🧠 MULTI-BOT: group-manager mode wale group me filter-settings nahi,
+    # balki Group Manager control panel dikhta hai.
+    if await is_mgmt_chat(message.chat.id):
+        from groupmgmt.menu import build_panel_markup, build_panel_text
+        gm_settings = await get_settings(message.chat.id)
+        return await message.reply(
+            build_panel_text(gm_settings, message.chat),
+            reply_markup=build_panel_markup(gm_settings),
+        )
+
     settings = await get_settings(message.chat.id)
     await message.reply(
         f"⚙️ <b>Welcome to Inline Control Center!</b>\n\nConfigure settings for <b>{message.chat.title}</b> 👇",
@@ -242,6 +255,11 @@ async def close_admin_panel(client, query):
 async def button_style_toggle(client, message):
     if message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
         if not await is_check_admin(client, message.chat.id, message.from_user.id): return
+        # 🧠 MULTI-BOT: ye filter-only setting hai — group-manager mode me nahi
+        if await is_mgmt_chat(message.chat.id):
+            return await message.reply(
+                "ℹ️ Ye group <b>Group Manager mode</b> me hai — auto-filter yahan active nahi hai."
+            )
 
     settings = await get_settings(message.chat.id)
     new_mode_val = not settings.get("simple_mode", True)
@@ -253,6 +271,12 @@ async def button_style_toggle(client, message):
 @Client.on_message(filters.command("search") & filters.group)
 async def search_toggle(client, message):
     if not await is_check_admin(client, message.chat.id, message.from_user.id): return
+    # 🧠 MULTI-BOT: group-manager mode me auto-filter chalta hi nahi
+    if await is_mgmt_chat(message.chat.id):
+        return await message.reply(
+            "ℹ️ Ye group <b>Group Manager mode</b> me hai — auto-filter yahan active nahi hai. "
+            "Auto filter ke liye bot admin se is group ko <code>/add_group</code> se register karwayein."
+        )
     if len(message.command) < 2: return await message.reply("Usage: `/search on` or `/search off`")
     state = True if message.command[1].lower() == "on" else False
     await save_group_settings(message.chat.id, "search_enabled", state)
@@ -272,6 +296,21 @@ async def pm_search(client, message):
             caption=script.PLAN_TXT.format(10, "@admin"), 
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 Buy Premium Plan", callback_data="activate_plan")]])
         )
+
+    # 🧠 MULTI-BOT: user jo "Group Manager" mode me hai uska PM search
+    # chalta nahi — usse uska (group-manager) menu dikhta hai. Bot-admins
+    # hamesha dono modes use kar sakte hain.
+    if uid not in ADMINS:
+        user_mode = await get_user_mode(uid)
+        if user_mode == MODE_MGMT:
+            return await message.reply(
+                "🛡️ <b>Aap abhi Group Manager mode me hain.</b>\n\n"
+                "PM search (auto filter) sirf <b>Auto Filter mode</b> me chalta hai. "
+                "Mode switch karne ke liye niche button dabayein.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔄 Switch Bot Mode", callback_data="mode_open")
+                ]])
+            )
     
     settings = await get_settings(message.chat.id)
     await auto_filter(client, message, collection_type="all", settings=settings)
@@ -280,6 +319,11 @@ async def pm_search(client, message):
 async def group_search(client, message):
     if not await is_valid_search(message): return
     chat_id, user_id = message.chat.id, message.from_user.id
+
+    # 🧠 MULTI-BOT: group-manager mode wale group me auto-filter CHALEGA HI
+    # NAHI (user ka rule). Wahan sirf group-management features kaam karte hain.
+    if await is_mgmt_chat(chat_id):
+        return
 
     settings = await get_settings(chat_id)
     if not settings.get("search_enabled", True): return

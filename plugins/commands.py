@@ -3,7 +3,7 @@ import random
 import logging
 from time import time as time_now
 from hydrogram import Client, filters, enums
-from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from Script import script
 # ✅ DRY: directory + post-category counts अब ia_filterdb के shared helpers से आते हैं
@@ -14,6 +14,11 @@ from database.ia_filterdb import (
     get_directory_counts, get_post_category_counts,
 )
 from database.users_chats_db import db
+# 🧠 MULTI-BOT: mode engine + mode-aware menu builders
+from modes import MODE_MGMT, get_group_mode
+from plugins.multibot import (
+    build_mode_menu, mode_picker_markup, resolve_start_state,
+)
 
 from info import (
     IS_PREMIUM, URL, BIN_CHANNEL, ADMINS,
@@ -21,25 +26,17 @@ from info import (
 )
 from utils import (
     is_premium, get_settings, get_size, temp,
-    get_readable_time, get_wish
+    get_readable_time, get_wish, build_mini_app_url
 )
 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
 # ✅ MINI APP URL - HTTPS Auto-Fix Sync
+# ✅ DRY: URL builder ab utils.build_mini_app_url() me hai (multi-bot ke
+# filter-panel aur group-manager-panel dono ko same link milega).
 # ─────────────────────────────────────────────
-def _build_mini_app_url(base_url: str) -> str:
-    url = base_url.strip() if base_url else ""
-    if not url:
-        return ""
-    if url.startswith("http://"):
-        url = "https://" + url[len("http://"):]
-    if not url.startswith("https://"):
-        url = f"https://{url}"
-    return f"{url.rstrip('/')}/miniapp"
-
-MINI_APP_URL = _build_mini_app_url(URL)
+MINI_APP_URL = build_mini_app_url(URL)
 
 
 # ─────────────────────────────────────────────
@@ -96,8 +93,16 @@ async def build_stats_texts():
 
 
 # ─────────────────────────────────────────────
-# 🚀 /start COMMAND HANDLER
+# 🚀 /start COMMAND HANDLER (🧠 MULTI-BOT AWARE)
 # ─────────────────────────────────────────────
+# ✅ MULTI-BOT LOGIC:
+# • GROUP me  → group ka mode dekha jata hai:
+#     - MODE_MGMT   → "Group Manager Bot" ka reply (auto-filter wahan OFF)
+#     - MODE_FILTER → classic auto-filter reply
+# • PM me     → user ka mode dekha jata hai:
+#     - Admin/Premium + mode set nahi → 🎬/🛡️ choice screen (pehli /start)
+#     - Mode set                    → us mode ka menu
+#     - Free user                   → 🛡️ Group Manager menu + 💎 premium CTA
 @Client.on_message(filters.command("start") & filters.incoming)
 async def start(client, message):
     if message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
@@ -108,6 +113,19 @@ async def start(client, message):
                 f"@{message.chat.username or 'Private'}", total
             ))
             await db.add_chat(message.chat.id, message.chat.title)
+
+        # 🧠 Group mode decide karta hai bot ka behaviour
+        group_mode = await get_group_mode(message.chat.id)
+        if group_mode == MODE_MGMT:
+            return await message.reply(
+                script.GROUP_START_GM_TXT.format(
+                    message.from_user.mention, message.chat.title
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🛡️ Group Manager Help", callback_data="gm_help")
+                ]])
+            )
+
         return await message.reply(
             f"<b>Hey {message.from_user.mention}, <i>{get_wish()}</i>\nHow can I help you?</b>"
         )
@@ -122,16 +140,19 @@ async def start(client, message):
             message.from_user.mention, message.from_user.id
         ))
 
-    if IS_PREMIUM and message.from_user.id not in ADMINS and not await is_premium(message.from_user.id, client):
-        return await message.reply_photo(
-            random.choice(PICS),
-            caption=script.PLAN_TXT.format(10, "@admin"),
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💎 Buy Premium Plan", callback_data="activate_plan")
-            ]])
-        )
-
+    # ── Deep-link file share (premium feature — gate yahin hai) ──
     if len(message.command) > 1 and message.command[1] != "premium":
+        # ✅ Free users ko file-share pe premium plan dikhta hai (unchanged
+        # behaviour) — plain /start pe nahi, kyunki ab wahan GM menu aata hai.
+        if IS_PREMIUM and message.from_user.id not in ADMINS and not await is_premium(message.from_user.id, client):
+            return await message.reply_photo(
+                random.choice(PICS),
+                caption=script.PLAN_TXT.format(10, "@admin"),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💎 Buy Premium Plan", callback_data="activate_plan")
+                ]])
+            )
+
         try:
             parts = message.command[1].split("_")
             if len(parts) >= 3:
@@ -180,18 +201,20 @@ async def start(client, message):
             return
         return
 
-    btn = [
-        [InlineKeyboardButton("🍿 Open Mini App", web_app=WebAppInfo(url=MINI_APP_URL))],
-        [InlineKeyboardButton("+ Add to Group +", url=f"https://t.me/{temp.U_NAME}?startgroup=start")],
-        [InlineKeyboardButton("👨‍🚒 Help Menu", callback_data="help"), InlineKeyboardButton("📊 Global Stats", callback_data="stats")]
-    ]
-    if message.from_user.id not in ADMINS:
-        btn.append([InlineKeyboardButton("💎 Premium Duration", callback_data="myplan")])
+    # ── 🧠 Mode-aware main menu ──
+    # ⚠️ yahan asli user object pass hota hai (message.from_user), na ki message
+    state = await resolve_start_state(message.from_user)
+
+    if state == "pick":
+        caption = script.MODE_PICK_TXT.format(message.from_user.mention, get_wish())
+        markup = mode_picker_markup()
+    else:
+        caption, markup = await build_mode_menu(message.from_user, state)
 
     await message.reply_photo(
         random.choice(PICS),
-        caption=script.START_TXT.format(message.from_user.mention, get_wish()),
-        reply_markup=InlineKeyboardMarkup(btn)
+        caption=caption,
+        reply_markup=markup
     )
 
 
@@ -292,25 +315,26 @@ async def link_generator(client, message):
 # ─────────────────────────────────────────────
 # 🎨 CENTRAL BUTTONS INLINE UI CALLBACKS - SECURE
 # ─────────────────────────────────────────────
-@Client.on_callback_query(filters.regex(r"^(help|user_cmds|admin_cmds|stats|back_start)$"))
+@Client.on_callback_query(filters.regex(r"^(help|user_cmds|admin_cmds|stats|back_start|gm_cmds)$"))
 async def ui_cb(client, query):
     data = query.data
     buttons_markup = None
 
     if data == "back_start":
-        text = script.START_TXT.format(query.from_user.mention, get_wish())
-        btn = [
-            [InlineKeyboardButton("🍿 Open Mini App", web_app=WebAppInfo(url=MINI_APP_URL))],
-            [InlineKeyboardButton("+ Add to Group +", url=f"https://t.me/{temp.U_NAME}?startgroup=start")],
-            [InlineKeyboardButton("👨‍🚒 Help Menu", callback_data="help"), InlineKeyboardButton("📊 Global Stats", callback_data="stats")]
-        ]
-        if query.from_user.id not in ADMINS:
-            btn.append([InlineKeyboardButton("💎 Premium Duration", callback_data="myplan")])
-        buttons_markup = InlineKeyboardMarkup(btn)
+        # 🧠 MULTI-BOT: back button bhi user ke current mode ke hisaab se kaam
+        # karta hai. ⚠️ query.from_user (asli user) — query.message.from_user
+        # PM me BOT hota hai, user nahi.
+        state = await resolve_start_state(query.from_user)
+        if state == "pick":
+            text = script.MODE_PICK_TXT.format(query.from_user.mention, get_wish())
+            buttons_markup = mode_picker_markup()
+        else:
+            text, buttons_markup = await build_mode_menu(query.from_user, state)
 
     elif data == "help":
         text = script.HELP_TXT.format(query.from_user.mention)
         btn = [[InlineKeyboardButton("👨‍💻 User Commands", callback_data="user_cmds")]]
+        btn[0].append(InlineKeyboardButton("🛡️ GM Commands", callback_data="gm_cmds"))
         if query.from_user.id in ADMINS:
             btn[0].append(InlineKeyboardButton("👮‍♂️ Admin Commands", callback_data="admin_cmds"))
         btn.append([InlineKeyboardButton("⬅️ Back Menu", callback_data="back_start")])
@@ -318,6 +342,12 @@ async def ui_cb(client, query):
 
     elif data == "user_cmds":
         text = script.USER_COMMAND_TXT
+        btn = [[InlineKeyboardButton("⬅️ Back Menu", callback_data="help")]]
+        buttons_markup = InlineKeyboardMarkup(btn)
+
+    elif data == "gm_cmds":
+        # 🛡️ Group-manager command list (har user ko dikhta hai)
+        text = script.GM_HELP_TXT
         btn = [[InlineKeyboardButton("⬅️ Back Menu", callback_data="help")]]
         buttons_markup = InlineKeyboardMarkup(btn)
 
