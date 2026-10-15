@@ -10,6 +10,9 @@ from database.users_chats_db import db
 # ✅ FIX: is_premium को अब plugins.premium की जगह utils से इम्पोर्ट किया गया है
 from utils import is_premium, temp, get_settings, is_rate_limited
 from Script import script
+# 🧠 MULTI-BOT: group me bot add hone par mode = GROUP MANAGER
+# (pehle se auto-filter ke liye registered group ka decision safe rehta hai)
+from modes import MODE_MGMT, ensure_mode_after_bot_add
 
 logger = logging.getLogger(__name__)
 
@@ -28,17 +31,38 @@ async def welcome(c, m):
         # ── केस 1: जब खुद बोट ग्रुप में ऐड हो ──
         if new_user.id == temp.ME:
             u = m.from_user.mention if m.from_user else "Admin"
-            await c.send_photo(
-                m.chat.id, 
-                random.choice(PICS), 
-                f"👋 <b>Hello {u},\n\nThanks for adding me to {m.chat.title}!</b>\n\n📌 <i>Don't forget to grant me full Administrator privileges with delete message permissions to keep this group clean and automated.</i>"
-            )
-            
-            if not await db.get_chat(m.chat.id):
+
+            # ⚠️ ORDER ZAROORI HAI: pehle "naya group hai ya nahi" check karo,
+            # uske baad hi add_chat() — kyunki add_chat() khud chat_status set
+            # kar deta hai aur uske baad get_chat() hamesha truthy aata (naya
+            # group hone par bhi LOG_CHANNEL ka #NewGroup alert chhoot jata).
+            is_new_group = not await db.get_chat(m.chat.id)
+
+            await db.add_chat(m.chat.id, m.chat.title)
+
+            # 🧠 MULTI-BOT RULE (user ka instruction):
+            # Bot jab bhi manually kisi group me add hota hai → us group ka
+            # mode **GROUP MANAGER** ho jata hai (auto-filter wahan chalega
+            # hi nahi). Admin ke PM se /add_group karne par hi FILTER mode
+            # milta hai.
+            # ⚠️ Rule modes.ensure_mode_after_bot_add() me hai (ek hi jagah):
+            # agar group pehle se auto-filter ke liye register hai to admin ka
+            # decision override nahi hota — isliye welcome text bhi usi mode
+            # ke hisaab se chunte hain (galat mode ka vaada nahi karte).
+            mode = await ensure_mode_after_bot_add(m.chat.id)
+
+            if is_new_group:
                 uname = f'@{m.chat.username}' if m.chat.username else 'Private'
                 total = await c.get_chat_members_count(m.chat.id)
                 await c.send_message(LOG_CHANNEL, script.NEW_GROUP_TXT.format(m.chat.title, m.chat.id, uname, total))       
-                await db.add_chat(m.chat.id, m.chat.title)
+
+            welcome_text = (
+                script.GROUP_ADDED_GM_TXT.format(u, m.chat.title)
+                if mode == MODE_MGMT
+                else script.GROUP_ADDED_FILTER_TXT.format(u, m.chat.title)
+            )
+
+            await c.send_photo(m.chat.id, random.choice(PICS), welcome_text)
             return
 
         # ── केस 2: ✅ FIX: जब कोई आम यूज़र (मेंबर) ग्रुप ज्वाइन करे ──

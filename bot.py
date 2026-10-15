@@ -4,6 +4,9 @@ import signal
 import os
 import time
 import gc
+import contextlib
+import importlib
+from pathlib import Path
 from typing import Union, AsyncGenerator
 from datetime import datetime
 import pytz
@@ -37,7 +40,11 @@ logger = logging.getLogger(__name__)
 from aiohttp import web
 from hydrogram import Client, types, StopPropagation, idle 
 from hydrogram.errors import FloodWait 
-from hydrogram.handlers import MessageHandler 
+from hydrogram.handlers import MessageHandler
+# ✅ NOTE: `Handler` base class hydrogram.handlers.__init__ me export nahi hota
+# (sirf concrete handlers export hote hain), isliye seedhe uska module import
+# karte hain — extra plugin-root loader me isinstance check ke liye chahiye.
+from hydrogram.handlers.handler import Handler
 from web import web_app
 from info import (
     API_ID, API_HASH, BOT_TOKEN, PORT, ADMINS, 
@@ -88,6 +95,13 @@ async def auto_delete_worker(bot):
 # ==========================================================
 # BOT CLIENT CLASS
 # ==========================================================
+# 🧠 MULTI-BOT: hydrogram ka plugin-loader sirf EK root folder support karta
+# hai. Isliye hum "groupmgmt" (group-manager features) ko EXTRA root ke taur
+# par manually load karte hain — isse group-management ka code filter-bot ke
+# code se physically alag folder me rehta hai (jo user ne maanga tha).
+EXTRA_PLUGIN_ROOTS = ("groupmgmt",)
+
+
 class Bot(Client):
     def __init__(self):
         super().__init__(
@@ -100,6 +114,49 @@ class Bot(Client):
         self._runner = None 
         self._premium_task = None 
         self._delete_task = None  
+
+    # ─────────────────────────────────────────────
+    # 🧩 PLUGIN LOADER (multi-root support)
+    # ─────────────────────────────────────────────
+    def load_plugins(self):
+        """Standard "plugins" root + extra roots (groupmgmt) load karta hai."""
+        super().load_plugins()
+
+        for root in EXTRA_PLUGIN_ROOTS:
+            self._load_plugin_root(root)
+
+    def _load_plugin_root(self, root):
+        """Hydrogram ke loader jaisa hi logic, kisi bhi extra root ke liye."""
+        count = 0
+        base = Path(root.replace(".", "/"))
+
+        if not base.exists():
+            logger.warning(f"⚠️ Extra plugin root not found: {root}")
+            return
+
+        for path in sorted(base.rglob("*.py")):
+            if path.name == "__init__.py":
+                continue
+
+            module_path = ".".join((*path.parent.parts, path.stem))
+            try:
+                module = importlib.import_module(module_path)
+            except Exception as e:
+                logger.error(f"❌ Failed to import {module_path}: {e}")
+                continue
+
+            for name in vars(module).values():
+                with contextlib.suppress(Exception):
+                    for handler, group in getattr(name, "handlers", []):
+                        if isinstance(handler, Handler) and isinstance(group, int):
+                            self.add_handler(handler, group)
+                            count += 1
+                            logger.info(
+                                "[%s] [LOAD] %s from '%s'",
+                                self.name, type(handler).__name__, module_path,
+                            )
+
+        logger.info(f"✅ Loaded {count} handlers from extra plugin root '{root}'")
 
     async def start(self):
         # 1. Start Pyrogram/Hydrogram Client Instance
