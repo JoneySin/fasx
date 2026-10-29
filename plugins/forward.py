@@ -24,6 +24,8 @@ from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from info import ADMINS, FORWARD_ENABLED
 from forward_service import (
+    DEFAULT_MEDIA_TYPES,
+    MEDIA_OPTIONS,
     ForwardError,
     ForwardJob,
     ValidationError,
@@ -92,14 +94,40 @@ def _get_setup(uid):
     return st
 
 
-def _summary_text(dst, src):
+def _media_labels(types):
+    return ", ".join(MEDIA_OPTIONS[t] for t in MEDIA_OPTIONS if t in types) or "कुछ नहीं"
+
+
+def _media_panel_text(types):
+    return (
+        "🎛 <b>Step 3/3 — क्या-क्या फ़ॉरवर्ड करना है?</b>\n\n"
+        "नीचे बटन दबाकर चुनें (✅ = चुना हुआ)। कम से कम एक चुनना होगा।\n"
+        f"चुना हुआ: <b>{html.escape(_media_labels(types))}</b>\n\n"
+        "Message नए मैसेज की तरह कॉपी होंगे (forward tag नहीं)। "
+        "Text-only messages कभी कॉपी नहीं होते।"
+    )
+
+
+def _media_markup(types):
+    rows = []
+    for key, label in MEDIA_OPTIONS.items():
+        mark = "✅" if key in types else "⬜"
+        rows.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"fwd#m#{key}")])
+    rows.append([
+        InlineKeyboardButton("➡️ आगे (Summary)", callback_data="fwd#mdone"),
+        InlineKeyboardButton("❌ Cancel", callback_data="fwd#cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _summary_text(dst, src, types=DEFAULT_MEDIA_TYPES):
     lo, hi = get_copy_delay_range()
     return (
         "🧾 <b>Forward Summary</b>\n\n"
         f"📤 <b>Source:</b> {html.escape(src.title)} <code>{src.chat_id}</code>\n"
         f"   └ {html.escape(src.note) if src.note else 'सदस्यता जाँची गई'}\n"
         f"📥 <b>Destination:</b> {html.escape(dst.title)} <code>{dst.chat_id}</code>\n\n"
-        "🎞️ Media: <b>केवल video</b> (photo/audio/PDF/ZIP/अन्य छोड़े जाएँगे)\n"
+        f"🎞️ Media: <b>{html.escape(_media_labels(types))}</b> (बाकी types छोड़े जाएँगे)\n"
         "📋 Mode: नया message (forward attribution नहीं), caption और original quality सुरक्षित\n"
         "🔎 Scan: पुराने से नए की ओर, batch में\n"
         f"⏱️ Delay: हर सफल copy के बाद {lo}–{hi} सेकंड (random)\n\n"
@@ -249,6 +277,10 @@ async def forward_setup_input(client, message):
         await _handle_login_input(message, state)
         raise StopPropagation
 
+    if state["step"] == "media":
+        await message.reply("⬆️ ऊपर के बटनों से media types चुनें, फिर ➡️ आगे दबाएँ, या /cancel भेजें।")
+        raise StopPropagation
+
     user = get_user_client()
     if user is None:
         try:
@@ -277,9 +309,10 @@ async def forward_setup_input(client, message):
             src = await check_source(user, ref)
             ensure_distinct_chats(src.chat_id, state["dst"].chat_id)
             state["src"] = src
-            _set_setup(message.from_user.id, "confirm")
-            text = _summary_text(state["dst"], src)
-            markup = _confirm_markup()
+            state["media"] = list(DEFAULT_MEDIA_TYPES)
+            _set_setup(message.from_user.id, "media")
+            text = _media_panel_text(state["media"])
+            markup = _media_markup(state["media"])
     except ValidationError as e:
         text = f"❌ {e}\n\nसही जानकारी दोबारा भेजें, या /cancel"
     except FloodWait as e:
@@ -348,10 +381,49 @@ async def forward_callbacks(client, query):
     if action == "start":
         return await _start_from_setup(client, query)
 
+    if action == "m" and len(parts) == 3:
+        return await _toggle_media(query, uid, parts[2])
+
+    if action == "mdone":
+        return await _media_done(query, uid)
+
     if action == "resume" and len(parts) == 3:
         return await _resume(client, query, parts[2])
 
     await query.answer("अज्ञात action।", show_alert=True)
+
+
+async def _toggle_media(query, uid, key):
+    state = _get_setup(uid)
+    if not state or state.get("step") != "media" or key not in MEDIA_OPTIONS:
+        return await query.answer("Setup नहीं मिला या expire हो गया। /forward से फिर शुरू करें।", show_alert=True)
+    types = list(state.get("media") or [])
+    if key in types:
+        types.remove(key)
+    else:
+        types.append(key)
+    state["media"] = types
+    await query.answer("✅ अपडेट" if key in types else "⬜ हटाया")
+    try:
+        await query.message.edit(_media_panel_text(types), reply_markup=_media_markup(types))
+    except Exception:
+        pass
+
+
+async def _media_done(query, uid):
+    state = _get_setup(uid)
+    if not state or state.get("step") != "media":
+        return await query.answer("Setup नहीं मिला या expire हो गया। /forward से फिर शुरू करें।", show_alert=True)
+    types = [t for t in MEDIA_OPTIONS if t in (state.get("media") or [])]
+    if not types:
+        return await query.answer("कम से कम एक media type चुनें।", show_alert=True)
+    state["media"] = types
+    _set_setup(uid, "confirm")
+    await query.answer()
+    try:
+        await query.message.edit(_summary_text(state["dst"], state["src"], types), reply_markup=_confirm_markup())
+    except Exception:
+        pass
 
 
 async def _start_from_setup(client, query):
@@ -374,6 +446,7 @@ async def _start_from_setup(client, query):
         dst_id=dst.chat_id,
         src_title=src.title,
         dst_title=dst.title,
+        media_types=tuple(t for t in MEDIA_OPTIONS if t in (state.get("media") or [])) or DEFAULT_MEDIA_TYPES,
     )
     try:
         await launch_job(client, job, user)

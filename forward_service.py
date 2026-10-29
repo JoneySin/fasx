@@ -147,24 +147,52 @@ def is_admin(user_id, admins) -> bool:
 # ─────────────────────────────────────────────
 # 🎞️ VIDEO FILTER (pure, testable)
 # ─────────────────────────────────────────────
-def is_forwardable_video(message) -> bool:
-    """केवल वास्तविक video media → True।
-    - Telegram native video → True
-    - Document जिसका MIME `video/*` है → True
-    - Photo, audio, voice, PDF, ZIP, GIF/animation, video note, sticker आदि → False
+# Admin के settings panel में चुनी जा सकने वाली media types (key → label)
+MEDIA_OPTIONS = {
+    "video": "🎬 Video",
+    "photo": "🖼 Photo",
+    "audio": "🎵 Audio",
+    "voice": "🎤 Voice",
+    "animation": "🎞 GIF / Animation",
+    "document": "📄 Document (non-video)",
+}
+DEFAULT_MEDIA_TYPES = ("video",)   # डिफ़ॉल्ट: केवल video (मूल नियम)
+
+
+def media_kind(message):
+    """Message की media type: MEDIA_OPTIONS का key या None (text, video_note, sticker आदि)।
     - Filename (.mp4 आदि) देखकर कभी video नहीं मानते।
+    - Document को तभी 'video' मानते हैं जब उसका MIME `video/*` हो।
     """
     if message is None or getattr(message, "empty", False):
-        return False
-    if getattr(message, "animation", None) or getattr(message, "video_note", None):
-        return False
+        return None
+    if getattr(message, "animation", None):
+        return "animation"
+    if getattr(message, "video_note", None):
+        return None
     if getattr(message, "video", None):
-        return True
+        return "video"
+    if getattr(message, "photo", None):
+        return "photo"
+    if getattr(message, "audio", None):
+        return "audio"
+    if getattr(message, "voice", None):
+        return "voice"
     doc = getattr(message, "document", None)
     if doc is not None:
         mime = (getattr(doc, "mime_type", None) or "").strip().lower()
-        return mime.startswith("video/")
-    return False
+        return "video" if mime.startswith("video/") else "document"
+    return None
+
+
+def should_forward(message, media_types) -> bool:
+    kind = media_kind(message)
+    return kind is not None and kind in set(media_types or DEFAULT_MEDIA_TYPES)
+
+
+def is_forwardable_video(message) -> bool:
+    """केवल वास्तविक video (मूल फ़िल्टर, अब should_forward का video-only रूप)।"""
+    return media_kind(message) == "video"
 
 
 # ─────────────────────────────────────────────
@@ -365,6 +393,7 @@ class ForwardJob:
     copied: int = 0
     failed: int = 0
     duplicates: int = 0
+    media_types: tuple = DEFAULT_MEDIA_TYPES   # कौन-सी media types कॉपी होंगी
     last_scanned_id: int = 0      # checkpoint: इस ID तक सब प्रोसेस हो चुका है
     max_id: int = 0               # शुरू होने के समय source का सबसे नया message ID
     wait_until: float = 0.0       # FloodWait खत्म होने का epoch time
@@ -390,6 +419,7 @@ def job_to_fields(job: ForwardJob) -> dict:
         "max_id": job.max_id,
         "wait_until": job.wait_until,
         "error": job.error,
+        "media_types": list(job.media_types),
     }
 
 
@@ -411,6 +441,7 @@ def job_from_doc(doc: dict) -> ForwardJob:
     job.max_id = doc.get("max_id", 0)
     job.wait_until = doc.get("wait_until", 0.0) or 0.0
     job.error = doc.get("error", "")
+    job.media_types = tuple(doc.get("media_types") or DEFAULT_MEDIA_TYPES)
     return job
 
 
@@ -439,6 +470,7 @@ def render_progress(job: ForwardJob) -> str:
         f"📤 <b>Source:</b> {html.escape(job.src_title or str(job.src_id))} <code>{job.src_id}</code>",
         f"📥 <b>Destination:</b> {html.escape(job.dst_title or str(job.dst_id))} <code>{job.dst_id}</code>",
         "",
+        f"🎞 Types: <code>{html.escape(', '.join(job.media_types))}</code>",
         f"🔎 Scanned messages: <code>{job.scanned}</code>",
         f"✅ Videos copied: <code>{job.copied}</code>",
         f"❌ Failed copies: <code>{job.failed}</code>",
@@ -552,7 +584,7 @@ async def run_forward_job(
                     continue
                 job.scanned += 1
 
-                if not is_forwardable_video(msg):
+                if not should_forward(msg, job.media_types):
                     job.last_scanned_id = msg.id
                     continue
 

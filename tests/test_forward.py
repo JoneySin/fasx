@@ -777,6 +777,73 @@ class TestLoginSteps(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────
+# 8c. MEDIA TYPE SELECTION (settings panel)
+# ─────────────────────────────────────────────
+class TestMediaTypes(unittest.TestCase):
+    def test_media_kind_classification(self):
+        self.assertEqual(fs.media_kind(video(1)), "video")
+        self.assertEqual(fs.media_kind(mp4_doc(2)), "video")
+        self.assertEqual(fs.media_kind(msg(3, photo=SimpleNamespace())), "photo")
+        self.assertEqual(fs.media_kind(msg(4, audio=SimpleNamespace())), "audio")
+        self.assertEqual(fs.media_kind(msg(5, voice=SimpleNamespace())), "voice")
+        self.assertEqual(fs.media_kind(msg(6, animation=SimpleNamespace())), "animation")
+        self.assertEqual(fs.media_kind(msg(7, document=SimpleNamespace(mime_type="application/pdf"))), "document")
+        self.assertIsNone(fs.media_kind(msg(8, video_note=SimpleNamespace())))
+        self.assertIsNone(fs.media_kind(msg(9)))  # text-only
+
+    def test_default_is_video_only(self):
+        self.assertTrue(fs.should_forward(video(1), fs.DEFAULT_MEDIA_TYPES))
+        self.assertFalse(fs.should_forward(msg(2, photo=SimpleNamespace()), fs.DEFAULT_MEDIA_TYPES))
+        self.assertFalse(fs.should_forward(msg(3, document=SimpleNamespace(mime_type="application/pdf")),
+                                           fs.DEFAULT_MEDIA_TYPES))
+
+    def test_selected_types_only_are_copied(self):
+        messages = {
+            1: video(1),
+            2: msg(2, photo=SimpleNamespace()),
+            3: msg(3, audio=SimpleNamespace()),
+            4: msg(4, document=SimpleNamespace(mime_type="application/pdf")),
+            5: video(5),
+        }
+        user, store = FakeUser(messages), MemoryStore()
+        result, _ = run_job(make_job(job_id="j", media_types=("photo", "document")), user, store)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual([c[2] for c in user.copies], [2, 4])
+
+    def test_media_types_survive_db_roundtrip_and_default_for_old_jobs(self):
+        job = make_job(job_id="x", media_types=("photo", "audio"))
+        back = fs.job_from_doc(dict(fs.job_to_fields(job), _id="x"))
+        self.assertEqual(back.media_types, ("photo", "audio"))
+        old_doc = {"_id": "y", "admin_id": 1, "src_id": SRC, "dst_id": DST}  # media_types नहीं था
+        self.assertEqual(fs.job_from_doc(old_doc).media_types, fs.DEFAULT_MEDIA_TYPES)
+
+    def test_toggle_and_done_rules(self):
+        import plugins.forward as pf
+        pf.SETUP.clear()
+        pf.SETUP[111] = {"step": "media", "ts": time.time(), "media": ["video"],
+                         "dst": fs.ChatInfo(DST, "D", "CHANNEL"), "src": fs.ChatInfo(SRC, "S", "CHANNEL")}
+
+        def q(data):
+            return SimpleNamespace(from_user=SimpleNamespace(id=111), data=data,
+                                   answer=mock.AsyncMock(), message=SimpleNamespace(edit=mock.AsyncMock()))
+
+        asyncio.run(pf.forward_callbacks(mock.AsyncMock(), q("fwd#m#photo")))
+        self.assertEqual(pf.SETUP[111]["media"], ["video", "photo"])
+        asyncio.run(pf.forward_callbacks(mock.AsyncMock(), q("fwd#m#video")))
+        self.assertEqual(pf.SETUP[111]["media"], ["photo"])
+        asyncio.run(pf.forward_callbacks(mock.AsyncMock(), q("fwd#m#video")))
+        asyncio.run(pf.forward_callbacks(mock.AsyncMock(), q("fwd#m#photo")))
+        self.assertEqual(pf.SETUP[111]["media"], ["video"])
+        # कोई भी चुनाव न हो तो आगे नहीं बढ़ता
+        pf.SETUP[111]["media"] = []
+        query = q("fwd#mdone")
+        asyncio.run(pf.forward_callbacks(mock.AsyncMock(), query))
+        self.assertEqual(pf.SETUP[111]["step"], "media")
+        self.assertTrue(query.answer.call_args.kwargs.get("show_alert"))
+        pf.SETUP.clear()
+
+
+# ─────────────────────────────────────────────
 # 9. SETUP FLOW (dest → source → summary → start) — Telegram calls mocked
 # ─────────────────────────────────────────────
 class TestSetupFlow(unittest.TestCase):
@@ -822,8 +889,15 @@ class TestSetupFlow(unittest.TestCase):
             m2, st2 = self._admin_msg(f"{SRC}")
             with self.assertRaises(StopPropagation):
                 asyncio.run(pf.forward_setup_input(None, m2))
-            self.assertEqual(pf.SETUP[111]["step"], "confirm")
-            self.assertIn("Forward Summary", st2.edit.call_args.args[0])
+            self.assertEqual(pf.SETUP[111]["step"], "media")
+            self.assertIn("क्या-क्या", st2.edit.call_args.args[0])
+
+        # media panel: डिफ़ॉल्ट video; "आगे" दबाने पर summary + confirm
+        qmedia = SimpleNamespace(from_user=SimpleNamespace(id=111), data="fwd#mdone",
+                                 answer=mock.AsyncMock(), message=SimpleNamespace(edit=mock.AsyncMock()))
+        asyncio.run(pf.forward_callbacks(mock.AsyncMock(), qmedia))
+        self.assertEqual(pf.SETUP[111]["step"], "confirm")
+        self.assertIn("Forward Summary", qmedia.message.edit.call_args.args[0])
 
         # Start button
         bot = mock.AsyncMock()
